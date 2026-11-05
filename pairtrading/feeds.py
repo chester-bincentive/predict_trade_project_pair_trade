@@ -194,6 +194,24 @@ def _ws_book(venue: str, outcome: str, token: str, bids: Any, asks: Any,
     )
 
 
+def _complement_binary_book(up_book: Book, down_token: str) -> Book:
+    """Derive the complementary DOWN book from a binary market's UP book."""
+    down_bids = tuple(sorted(
+        (Level(1.0 - level.price, level.size) for level in up_book.asks),
+        key=lambda level: level.price,
+        reverse=True,
+    ))
+    down_asks = tuple(sorted(
+        (Level(1.0 - level.price, level.size) for level in up_book.bids),
+        key=lambda level: level.price,
+    ))
+    return Book(
+        "binance", "DOWN", down_token, down_bids, down_asks,
+        up_book.received_at, up_book.source_at,
+        up_book.request_started_at, up_book.request_rtt_ms,
+    )
+
+
 class PolymarketFeed:
     """Read-only Gamma market discovery; CLOB books arrive from its market WebSocket."""
 
@@ -349,6 +367,7 @@ class PairMarketFeed:
         self._poly_state: dict[str, dict[str, Any]] = {}
         self._binance_update_ms: dict[str, int] = {}
         self._binance_id_outcomes: dict[str, str] = {}
+        self._binance_shared_market_id = False
         self._book_updated = asyncio.Event()
         self._stream_key: tuple[str, ...] | None = None
         self._stream_tasks: tuple[asyncio.Task[None], ...] = ()
@@ -455,11 +474,16 @@ class PairMarketFeed:
         if not up_id or not down_id:
             raise FeedError("Binance market metadata is missing the outcome marketId needed for WebSocket topics")
         if str(up_id) == str(down_id):
-            raise FeedError(
-                "Binance UP and DOWN resolve to the same marketId; its orderbook WebSocket payload has no tokenId "
-                "to distinguish the two outcome books"
-            )
-        self._binance_id_outcomes = {str(up_id): "UP", str(down_id): "DOWN"}
+            if binance_market.up_token == binance_market.down_token:
+                raise FeedError("Binance binary market exposes the same token ID for UP and DOWN")
+            # Current Binance metadata provides one binary marketId with UP and DOWN
+            # outcome tokens. Its orderbook stream identifies only that marketId;
+            # the stream's single book tracks UP, so derive DOWN at complementary prices.
+            self._binance_id_outcomes = {str(up_id): "UP"}
+            self._binance_shared_market_id = True
+        else:
+            self._binance_id_outcomes = {str(up_id): "UP", str(down_id): "DOWN"}
+            self._binance_shared_market_id = False
         self._stream_key = key
         self._active_pair = (poly_market, binance_market, skew)
         self._stream_tasks = (
@@ -612,6 +636,17 @@ class PairMarketFeed:
                 try:
                     payload = json.loads(payload)
                 except json.JSONDecodeError as exc:
+                    if str(message.get("type", "")).upper() == "COMMAND":
+                        try:
+                            ack_code = int(message.get("code"))
+                        except (TypeError, ValueError):
+                            ack_code = None
+                        if ack_code == 0:
+                            continue
+                        if ack_code is not None:
+                            raise FeedError(
+                                f"Binance orderbook subscription failed with code {ack_code}"
+                            ) from exc
                     raise FeedError("Binance orderbook envelope contains malformed data JSON") from exc
             updates = payload if isinstance(payload, list) else [payload]
             for update in updates:
@@ -635,6 +670,11 @@ class PairMarketFeed:
                 self._publish_ws_book(
                     "binance", outcome, token, update.get("bids"), update.get("asks"), received, source_at,
                 )
+                if self._binance_shared_market_id and outcome == "UP":
+                    up_book = self._books[("binance", "UP")]
+                    down_token = self._active_pair[1].down_token
+                    self._books[("binance", "DOWN")] = _complement_binary_book(up_book, down_token)
+                    self._book_updated.set()
 
     def _publish_ws_book(self, venue: str, outcome: str, token: str, bids: Any, asks: Any,
                          received: datetime, source_at: datetime | None) -> None:
@@ -644,7 +684,7 @@ class PairMarketFeed:
 
     async def _run_binance(self, market: Market) -> None:
         assert market.up_market_id is not None and market.down_market_id is not None
-        market_ids = (str(market.up_market_id), str(market.down_market_id))
+        market_ids = tuple(dict.fromkeys((str(market.up_market_id), str(market.down_market_id))))
         delay = 1.0
         while not self._closed:
             self._clear_venue_books("binance")

@@ -41,6 +41,8 @@ Discord 損益推送是選用功能：在 Discord 目標伺服器的「伺服器
 - 配對成交部分從較晚一腿成交後持有 20 秒，再對兩腿分別模擬延遲平倉，按可見 bid 深度逐檔成交。部分退出會以新訂單延遲後重試。進出場都計 taker fee，預設每份 `0.07 * p * (1-p)`。
 - Gamma 與 Binance market metadata 仍由 REST 更新；Polymarket CLOB 與 Binance Predict 的 L2 order book 改由 WebSocket 推送。SQLite 保存每個 outcome 的完整 L2 snapshot 和價位，shadow 事件引用 snapshot ID，並記錄 VWAP、fee、partial fill/cancel、source age 及模擬訂單 latency 分量。
 
+Binance 目前的二元市場 metadata 會提供一個 `marketId` 與 UP/DOWN 兩個 outcome token；orderbook WebSocket payload 只帶 `marketId`，不帶 `tokenId`。程式以該 stream 的 UP 簿作為基準，依二元合約互補關係推導 DOWN 簿：DOWN bids = `1 - UP asks`、DOWN asks = `1 - UP bids`，保留每檔數量。DOWN 因此是從同一份 Binance stream 推導，並非第二份獨立行情簿。
+
 ## 延遲量測與限制
 
 Order book 透過 WebSocket 接收：Polymarket 先用完整簿初始化，再將價格檔增量套用到本地簿；Binance 推送完整簿，並依來源時間戳忽略較舊更新。行情快照由更新事件觸發，短暫合併密集事件；市場 metadata 仍每 10 秒用 REST 更新。資料庫保存來源時間戳可用時的 source age，以及本機 WebSocket 收到時間；沒有來源時間戳時以本機收到時間計算 freshness。WebSocket feed 不提供單次 order-book request RTT；report 會把保留下來的舊 REST RTT 樣本數與平均值單獨標出，新 WebSocket 樣本的 RTT 欄位留空。

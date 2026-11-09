@@ -105,8 +105,8 @@ class ShadowExecutionTests(unittest.TestCase):
 
         snapshots = self.store.db.execute("SELECT COUNT(*) FROM book_snapshots").fetchone()[0]
         levels = self.store.db.execute("SELECT COUNT(*) FROM book_levels").fetchone()[0]
-        self.assertEqual(snapshots, 24)
-        self.assertEqual(levels, 48)
+        self.assertEqual(snapshots, 0)
+        self.assertEqual(levels, 0)
 
 
 if __name__ == "__main__":

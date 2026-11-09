@@ -8,8 +8,9 @@ from typing import Any
 
 from .config import Settings
 from .models import Book, Level, PairSnapshot
+from .shadow import ShadowEngine
 from .storage import Store
-from .strategy import RollingCalibration, event_bucket, mid_spread, quote_row
+from .strategy import RollingCalibration, event_bucket, mid_spread
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,14 +39,15 @@ def sweep(book: Book, *, side: str, shares: float, fee_coefficient: float) -> Sw
     return None
 
 
-class PaperEngine:
-    """Finite-horizon, depth-aware paper execution. It has no live-order path."""
+class _ImmediatePaperEngine:
+    """Deprecated immediate-fill implementation; public PaperEngine no longer uses it."""
 
     def __init__(self, store: Store, settings: Settings) -> None:
         self.store = store
         self.settings = settings
         self.calibration = RollingCalibration(
-            store, window=settings.history_window_markets, bucket_seconds=settings.bucket_seconds
+            store, window=settings.history_window_markets, rv_window=settings.rv_history_window_markets,
+            bucket_seconds=settings.bucket_seconds
         )
         self.positions: dict[str, dict[str, Any]] = {
             row["market_key"]: row for row in store.open_positions()
@@ -58,7 +60,6 @@ class PaperEngine:
         bucket = event_bucket(elapsed, self.settings.bucket_seconds)
         spread = mid_spread(snapshot)
         self.calibration.observe(snapshot, spread, bucket)
-        self.store.record_quote(quote_row(snapshot, elapsed=elapsed, bucket=bucket, spread=spread))
 
         closed = self._try_close(snapshot)
         if closed:
@@ -160,8 +161,12 @@ class PaperEngine:
         return None
 
 
+class PaperEngine(ShadowEngine):
+    """Paper-trade name for the delayed, arrival-time memory-book simulator."""
+
+
 def demo(settings: Settings) -> None:
-    """Deterministic no-network run through the same signal/fill/exit logic."""
+    """Deterministic no-network demo of delayed, arrival-time memory-book fills."""
     from datetime import timedelta
     from pathlib import Path
     import tempfile
@@ -177,10 +182,17 @@ def demo(settings: Settings) -> None:
             z_entry=settings.z_entry,
             min_history_markets=settings.min_history_markets,
             history_window_markets=settings.history_window_markets,
+            min_rv_history_markets=settings.min_rv_history_markets,
+            rv_history_window_markets=settings.rv_history_window_markets,
             bucket_seconds=settings.bucket_seconds,
             hold_seconds=settings.hold_seconds,
             min_shares=settings.min_shares,
             taker_fee_coefficient=settings.taker_fee_coefficient,
+            poly_order_network_ms=settings.poly_order_network_ms,
+            poly_order_api_ms=settings.poly_order_api_ms,
+            binance_order_network_ms=settings.binance_order_network_ms,
+            binance_order_api_ms=settings.binance_order_api_ms,
+            order_latency_jitter_ms=settings.order_latency_jitter_ms,
             db_path=Path(temp) / "demo.sqlite3",
         )
         store = Store(demo_settings.db_path)
@@ -188,7 +200,7 @@ def demo(settings: Settings) -> None:
         market_start = base - timedelta(seconds=130)
         market_end = market_start + timedelta(seconds=300)
         market_key = "btc-updown-5m-demo"
-        engine = PaperEngine(store, demo_settings)
+        engine = ShadowEngine(store, demo_settings)
         poly = Market("polymarket", market_key, "Demo Poly", market_start, market_end, "pu", "pd")
         binance = Market("binance", "demo-binance", "Demo Binance", market_start, market_end, "bu", "bd")
 
@@ -198,28 +210,56 @@ def demo(settings: Settings) -> None:
                         (Level(ask, 20), Level(min(0.99, ask + 0.01), 20)), stamp, stamp)
 
         entry_at = base
+        warmup_at = entry_at - timedelta(seconds=10)
+        warmup_books = {
+            ("polymarket", "UP"): make_book("polymarket", "UP", "pu", .49, .51, warmup_at),
+            ("polymarket", "DOWN"): make_book("polymarket", "DOWN", "pd", .49, .51, warmup_at),
+            ("binance", "UP"): make_book("binance", "UP", "bu", .49, .51, warmup_at),
+            ("binance", "DOWN"): make_book("binance", "DOWN", "bd", .49, .51, warmup_at),
+        }
         entry_books = {
             ("polymarket", "UP"): make_book("polymarket", "UP", "pu", .29, .31, entry_at),
             ("polymarket", "DOWN"): make_book("polymarket", "DOWN", "pd", .69, .71, entry_at),
             ("binance", "UP"): make_book("binance", "UP", "bu", .70, .72, entry_at),
             ("binance", "DOWN"): make_book("binance", "DOWN", "bd", .30, .32, entry_at),
         }
+        warmup = PairSnapshot(market_key, poly, binance, warmup_books, warmup_at, 0.0)
         entry = PairSnapshot(market_key, poly, binance, entry_books, entry_at, 0.0)
         print("DEMO ONLY - synthetic fixture data; no network or real orders")
-        print("WARMUP:", engine.process(entry))
+        print("WARMUP:", engine.process(warmup))
         # Synthetic closed-market medians are isolated demo fixtures, never live history.
         bucket_count = (300 + demo_settings.bucket_seconds - 1) // demo_settings.bucket_seconds
-        seed_count = max(100, demo_settings.min_history_markets)
+        seed_count = max(100, demo_settings.min_history_markets,
+                         demo_settings.rv_history_window_markets,
+                         demo_settings.min_rv_history_markets)
         for bucket in range(bucket_count):
+            rv_fixture_rows = []
             for index in range(seed_count):
                 value = (index - (seed_count - 1) / 2.0) * 0.0008
+                market_end = market_start.timestamp() - (seed_count-index) * 300
+                rv_value = 0.02 + index * 0.0001
                 store.save_history(f"demo-closed-{bucket}-{index}",
-                                   market_start.timestamp() - (seed_count-index) * 300,
+                                   market_end,
                                    bucket, value, 60)
-        print(f"synthetic fixture calibration: {seed_count} closed markets per bucket (temporary DB only)")
+                rv_fixture_rows.append((f"demo-closed-{bucket}-{index}", market_end,
+                                        bucket, rv_value, 50))
+            store.save_rv_history_batch(rv_fixture_rows)
+        print(f"synthetic fixture calibration: {seed_count} closed markets per bucket for spread and RV10 q90 (temporary DB only)")
         print("ENTRY:", engine.process(entry))
 
-        exit_at = entry_at + timedelta(seconds=demo_settings.hold_seconds)
+        delay_seconds = (demo_settings.poly_order_network_ms + demo_settings.poly_order_api_ms
+                         + demo_settings.order_latency_jitter_ms) / 1000.0
+        entry_arrival = entry_at + timedelta(seconds=delay_seconds)
+        entry_arrival_snapshot = PairSnapshot(
+            market_key, poly, binance, entry_books, entry_arrival, 0.0
+        )
+        print("ENTRY ARRIVAL (same already-received memory books; no new quote):",
+              engine.process(entry_arrival_snapshot, evaluate_signals=False))
+
+        hold_due = (float(engine.active["hold_due_epoch"]) if engine.active is not None
+                    and engine.active.get("hold_due_epoch") is not None
+                    else entry_arrival.timestamp() + demo_settings.hold_seconds)
+        exit_at = datetime.fromtimestamp(hold_due, tz=timezone.utc)
         exit_books = {
             ("polymarket", "UP"): make_book("polymarket", "UP", "pu", .38, .40, exit_at),
             ("polymarket", "DOWN"): make_book("polymarket", "DOWN", "pd", .60, .62, exit_at),
@@ -227,5 +267,11 @@ def demo(settings: Settings) -> None:
             ("binance", "DOWN"): make_book("binance", "DOWN", "bd", .33, .35, exit_at),
         }
         exit_snapshot = PairSnapshot(market_key, poly, binance, exit_books, exit_at, 0.0)
-        print("EXIT:", engine.process(exit_snapshot))
+        print("EXIT SUBMIT:", engine.process(exit_snapshot, evaluate_signals=False))
+        exit_arrival = exit_at + timedelta(seconds=delay_seconds)
+        exit_arrival_snapshot = PairSnapshot(
+            market_key, poly, binance, exit_books, exit_arrival, 0.0
+        )
+        print("EXIT ARRIVAL (same already-received memory books; no new quote):",
+              engine.process(exit_arrival_snapshot, evaluate_signals=False))
         store.close()

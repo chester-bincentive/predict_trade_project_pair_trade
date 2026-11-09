@@ -7,6 +7,8 @@ from collections import defaultdict
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+import uuid
 
 import httpx
 from dotenv import load_dotenv
@@ -17,6 +19,7 @@ from .feeds import FeedError, PairMarketFeed
 from .paper import demo
 from .shadow import ShadowEngine
 from .storage import Store
+from .strategy import RollingCalibration
 
 
 def _arguments() -> argparse.Namespace:
@@ -66,9 +69,33 @@ def _line(snapshot, message: str) -> str:
 
 async def _live(settings: Settings, duration: float) -> None:
     store = Store(settings.db_path)
-    engine = ShadowEngine(store, settings)
-    feed = PairMarketFeed(settings)
+    run_id = uuid.uuid4().hex
     start = time.monotonic()
+    store.record_runtime_event(
+        run_id=run_id, event_type="run_started",
+        details={
+            "mode": "live_shadow", "z_entry": settings.z_entry,
+            "spread_history_window_markets": settings.history_window_markets,
+            "rv_history_window_markets": settings.rv_history_window_markets,
+            "min_rv_history_markets": settings.min_rv_history_markets,
+            "shares_per_leg": settings.min_shares,
+            "fee_coefficient": settings.taker_fee_coefficient,
+            "max_quote_age_seconds": settings.max_quote_age_seconds,
+            "order_delay_ms": {
+                "polymarket": settings.poly_order_network_ms + settings.poly_order_api_ms,
+                "binance": settings.binance_order_network_ms + settings.binance_order_api_ms,
+            },
+        },
+    )
+
+    def record_subscription(venue: str, market_key: str, details: dict[str, Any]) -> None:
+        store.record_runtime_event(
+            run_id=run_id, event_type="market_subscription",
+            market_key=market_key, venue=venue, details=details,
+        )
+
+    engine = ShadowEngine(store, settings, run_id=run_id)
+    feed = PairMarketFeed(settings, subscription_recorder=record_subscription)
     next_clock_sync = start + 3600.0
     notifier: DiscordPnLNotifier | None = None
     notifier_task: asyncio.Task[None] | None = None
@@ -76,13 +103,14 @@ async def _live(settings: Settings, duration: float) -> None:
     print(f"rolling={settings.history_window_markets} completed markets, min={settings.min_history_markets}, "
           f"bucket={settings.bucket_seconds}s, z-entry={settings.z_entry:g}, "
           f"hold={settings.hold_seconds}s, min-shares={settings.min_shares:g}, fee=%.3g*p*(1-p)" % settings.taker_fee_coefficient)
-    print("Measured: WebSocket receive/source-data age; order-book request RTT is unavailable from the stream. "
-          "Simulated assumptions per order: "
-          f"Poly network/API={settings.poly_order_network_ms:g}/{settings.poly_order_api_ms:g}ms, "
-          f"Binance={settings.binance_order_network_ms:g}/{settings.binance_order_api_ms:g}ms, "
-          f"uniform jitter=0..{settings.order_latency_jitter_ms:g}ms.")
-    print("Each simulated order can fill only from a fresh WebSocket book update received after its arrival; "
-          "IOC remainder is canceled/retried only for exposure unwind and exit.")
+    print(f"Entry filter: |z| >= {settings.z_entry:g} and RV10 > same-bucket historical q90 "
+          f"(last {settings.rv_history_window_markets} completed markets; "
+          f"minimum {settings.min_rv_history_markets}).")
+    print("Paper fill events retain WebSocket source-data age; raw quote/orderbook snapshots are not stored. "
+          "Order-book request RTT is unavailable from the stream.")
+    print("Simulated order delay: fixed 330ms from submit to arrival, with no jitter.")
+    print("At arrival, the first IOC uses the newest in-memory WebSocket book received by that instant; "
+          "it does not wait for a new quote. IOC remainder retries wait for a later book update.")
     try:
         await feed.start()
         if settings.discord_webhook_url:
@@ -100,9 +128,37 @@ async def _live(settings: Settings, duration: float) -> None:
                 next_clock_sync = now + 3600.0
             try:
                 remaining = None if duration <= 0 else max(0.0, duration - (now - start))
-                snapshot = await feed.capture(timeout_seconds=1.0 if remaining is None else min(1.0, remaining))
+                due = engine.next_wakeup_epoch()
+                wall_now = time.time()
+                if due is not None and due <= wall_now:
+                    arrival_snapshot = feed.snapshot_at(due)
+                    if arrival_snapshot is not None:
+                        status = engine.process(arrival_snapshot, evaluate_signals=False)
+                        print(_line(arrival_snapshot, status), flush=True)
+                        continue
+                until_due = 1.0 if due is None or due <= wall_now else due - wall_now
+                timeout = min(1.0, until_due)
+                if remaining is not None:
+                    timeout = min(timeout, remaining)
+                snapshot = await feed.capture(timeout_seconds=timeout)
                 if snapshot is None:
+                    due = engine.next_wakeup_epoch()
+                    if due is not None and due <= time.time():
+                        arrival_snapshot = feed.snapshot_at(due)
+                        if arrival_snapshot is not None:
+                            status = engine.process(arrival_snapshot, evaluate_signals=False)
+                            print(_line(arrival_snapshot, status), flush=True)
                     continue
+                # If a WebSocket update and an order timer race, replay every
+                # due arrival against its exact as-of memory-book snapshot first.
+                due = engine.next_wakeup_epoch()
+                while due is not None and due <= snapshot.captured_at.timestamp():
+                    arrival_snapshot = feed.snapshot_at(due)
+                    if arrival_snapshot is None:
+                        break
+                    status = engine.process(arrival_snapshot, evaluate_signals=False)
+                    print(_line(arrival_snapshot, status), flush=True)
+                    due = engine.next_wakeup_epoch()
                 status = engine.process(snapshot)
                 print(_line(snapshot, status), flush=True)
                 engine.calibration.close_completed(snapshot.captured_at)
@@ -122,7 +178,13 @@ async def _live(settings: Settings, duration: float) -> None:
                 try:
                     await feed.close()
                 finally:
-                    store.close()
+                    try:
+                        store.record_runtime_event(
+                            run_id=run_id, event_type="run_stopped",
+                            details={"duration_seconds": round(time.monotonic() - start, 3)},
+                        )
+                    finally:
+                        store.close()
 
 
 def main() -> None:
@@ -145,7 +207,14 @@ def main() -> None:
     if args.mode == "history-status":
         store = Store(settings.db_path)
         try:
+            RollingCalibration(
+                store, window=settings.history_window_markets,
+                rv_window=settings.rv_history_window_markets,
+                bucket_seconds=settings.bucket_seconds,
+            )
             rows = store.history_status()
+            rv_rows = {bucket: (count, latest) for bucket, count, latest in
+                       store.rv_history_status(before_market_start=time.time())}
             print(f"Calibration database: {settings.db_path}")
             for bucket, count, latest in rows:
                 last_text = "none" if latest is None else datetime.fromtimestamp(latest, timezone.utc).isoformat()
@@ -154,8 +223,18 @@ def main() -> None:
                 print(f"bucket {bucket} ({bucket * settings.bucket_seconds}-{bucket_end}s): "
                       f"stored={count}; rolling-window={min(count, settings.history_window_markets)}/"
                       f"{settings.history_window_markets}; {state}; latest={last_text}")
+            for bucket in range((300 + settings.bucket_seconds - 1) // settings.bucket_seconds):
+                count, latest = rv_rows.get(bucket, (0, None))
+                state = "READY" if count >= settings.min_rv_history_markets else "WARMUP"
+                latest_text = "none" if latest is None else datetime.fromtimestamp(
+                    latest, timezone.utc
+                ).isoformat()
+                print(f"RV10 q90 bucket {bucket}: stored={count}; rolling-window="
+                      f"{min(count, settings.rv_history_window_markets)}/"
+                      f"{settings.rv_history_window_markets}; min={settings.min_rv_history_markets}; "
+                      f"{state}; latest={latest_text}")
             if not rows:
-                print("No calibration history yet. Run live mode; it will collect quotes without trading until warm-up completes.")
+                print("No spread calibration history yet. Run live mode to collect market data.")
         finally:
             store.close()
         return
@@ -171,7 +250,8 @@ def main() -> None:
             seed_csv.unlink()
         print(f"Deleted {deleted_rows} calibration rows from {settings.db_path}.")
         print(f"Removed old bundled market_history.csv: {'yes' if removed_seed else 'no'}.")
-        print("Quote ticks, full-depth book snapshots, shadow logs, and paper records were preserved.")
+        print("Legacy quote/orderbook rows and paper-trade logs were preserved; live mode no longer writes raw snapshots.")
+        print("RV10 history was cleared too; preserved legacy quote ticks will not rebuild it automatically.")
         return
     if args.mode == "report":
         store = Store(settings.db_path)
@@ -197,8 +277,6 @@ def main() -> None:
                 if row["net_pnl"] is not None:
                     day = datetime.fromtimestamp(float(row["decision_epoch"]), timezone.utc).date().isoformat()
                     daily[day].append(float(row["net_pnl"]))
-            snapshots, levels, events = store.orderbook_storage_stats()
-            n, rtt_count, avg_rtt, med_rtt, avg_age, med_age, source_count = store.latency_summary()
             print(f"Shadow report: {settings.db_path}")
             print(f"Signals={total}; at least some paired={any_pair}/{total}; fully paired={full}/{total}; "
                   f"NO_PAIR={no_pair}; unresolved at market end={unresolved}")
@@ -227,17 +305,11 @@ def main() -> None:
                 ))
             else:
                 print("Closed-only net PnL / win rate: n/a")
-            def fmt(value):
-                return "n/a" if value is None else f"{value:.1f}ms"
-            print(f"Measured live data ({n} book snapshots): legacy REST RTT rows={rtt_count}, "
-                  f"avg/median="
-                  f"{fmt(avg_rtt)}/{fmt(med_rtt)}; source age avg/median="
-                  f"{fmt(avg_age)}/{fmt(med_age)} (source timestamps present {source_count}/{n})")
-            print("Simulated order latency assumptions: "
-                  f"Poly network/API={settings.poly_order_network_ms:g}/{settings.poly_order_api_ms:g}ms; "
-                  f"Binance={settings.binance_order_network_ms:g}/{settings.binance_order_api_ms:g}ms; "
-                  f"jitter=0..{settings.order_latency_jitter_ms:g}ms")
-            print(f"Stored {snapshots} per-outcome full-depth snapshots, {levels} levels, {events} shadow events.")
+            print("Simulated order delay: fixed "
+                  f"{settings.poly_order_network_ms + settings.poly_order_api_ms:g}ms per order; "
+                  f"jitter=0..{settings.order_latency_jitter_ms:g}ms; "
+                  "first IOC uses latest in-memory book as of arrival")
+            print("Live mode keeps books in memory; the database stores trade and runtime events only.")
             if unresolved:
                 print("Unresolved trades are excluded from PnL; no settlement result is invented.")
         finally:

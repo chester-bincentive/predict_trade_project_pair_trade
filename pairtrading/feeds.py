@@ -12,7 +12,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlencode
 
 import httpx
@@ -351,10 +351,12 @@ class BinancePredictFeed:
 class PairMarketFeed:
     """Refresh market metadata over REST and stream paired L2 books over WebSockets."""
 
-    def __init__(self, settings: Any) -> None:
+    def __init__(self, settings: Any, *,
+                 subscription_recorder: Callable[[str, str, dict[str, Any]], None] | None = None) -> None:
         timeout = httpx.Timeout(8.0, connect=5.0)
         self.client = httpx.AsyncClient(timeout=timeout)
         self.settings = settings
+        self.subscription_recorder = subscription_recorder
         self.poly = PolymarketFeed(self.client)
         self.binance = BinancePredictFeed(
             self.client, os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_API_SECRET", "")
@@ -364,6 +366,7 @@ class PairMarketFeed:
         self._binance_markets: tuple[Market, ...] = ()
         self._closed = False
         self._books: dict[tuple[str, str], Book] = {}
+        self._book_history: dict[tuple[str, str], list[Book]] = {}
         self._poly_state: dict[str, dict[str, Any]] = {}
         self._binance_update_ms: dict[str, int] = {}
         self._binance_id_outcomes: dict[str, str] = {}
@@ -372,6 +375,11 @@ class PairMarketFeed:
         self._stream_key: tuple[str, ...] | None = None
         self._stream_tasks: tuple[asyncio.Task[None], ...] = ()
         self._active_pair: tuple[Market, Market, float] | None = None
+
+    def _record_subscription(self, venue: str, market: Market,
+                             details: dict[str, Any]) -> None:
+        if self.subscription_recorder is not None:
+            self.subscription_recorder(venue, market.key, details)
 
     async def start(self) -> None:
         if not self.binance.api_key or not self.binance.api_secret:
@@ -467,6 +475,7 @@ class PairMarketFeed:
         if self._stream_tasks:
             await asyncio.gather(*self._stream_tasks, return_exceptions=True)
         self._books.clear()
+        self._book_history.clear()
         self._poly_state.clear()
         self._binance_update_ms.clear()
         self._book_updated.clear()
@@ -503,10 +512,39 @@ class PairMarketFeed:
             {key: self._books[key] for key in keys}, utc_now(), skew,
         )
 
+    def snapshot_at(self, at_epoch: float) -> PairSnapshot | None:
+        """Return the newest in-memory order books received by this instant."""
+        if self._active_pair is None:
+            return None
+        poly_market, binance_market, skew = self._active_pair
+        keys = (("polymarket", "UP"), ("polymarket", "DOWN"),
+                ("binance", "UP"), ("binance", "DOWN"))
+        books: dict[tuple[str, str], Book] = {}
+        for key in keys:
+            eligible = [book for book in self._book_history.get(key, ())
+                        if book.received_at.timestamp() <= at_epoch + 1e-9]
+            if not eligible:
+                return None
+            books[key] = eligible[-1]
+        return PairSnapshot(
+            poly_market.key, poly_market, binance_market, books,
+            datetime.fromtimestamp(at_epoch, tz=timezone.utc), skew,
+        )
+
+    def _remember_book(self, key: tuple[str, str], book: Book) -> None:
+        history = self._book_history.setdefault(key, [])
+        history.append(book)
+        cutoff = book.received_at.timestamp() - 30.0
+        while len(history) > 1 and history[0].received_at.timestamp() < cutoff:
+            history.pop(0)
+
     def _clear_venue_books(self, venue: str) -> None:
         for key in tuple(self._books):
             if key[0] == venue:
                 del self._books[key]
+        for key in tuple(self._book_history):
+            if key[0] == venue:
+                del self._book_history[key]
         if venue == "polymarket":
             self._poly_state.clear()
         else:
@@ -527,6 +565,9 @@ class PairMarketFeed:
                         "type": "market", "assets_ids": [market.up_token, market.down_token],
                         "custom_feature_enabled": True,
                     }))
+                    self._record_subscription("polymarket", market, {
+                        "status": "subscribed", "token_ids": [market.up_token, market.down_token],
+                    })
                     heartbeat = asyncio.create_task(self._polymarket_heartbeat(ws))
                     try:
                         async for raw in ws:
@@ -673,13 +714,17 @@ class PairMarketFeed:
                 if self._binance_shared_market_id and outcome == "UP":
                     up_book = self._books[("binance", "UP")]
                     down_token = self._active_pair[1].down_token
-                    self._books[("binance", "DOWN")] = _complement_binary_book(up_book, down_token)
+                    down_book = _complement_binary_book(up_book, down_token)
+                    self._books[("binance", "DOWN")] = down_book
+                    self._remember_book(("binance", "DOWN"), down_book)
                     self._book_updated.set()
 
     def _publish_ws_book(self, venue: str, outcome: str, token: str, bids: Any, asks: Any,
                          received: datetime, source_at: datetime | None) -> None:
         key = (venue, outcome)
-        self._books[key] = _ws_book(venue, outcome, token, bids, asks, received, source_at)
+        book = _ws_book(venue, outcome, token, bids, asks, received, source_at)
+        self._books[key] = book
+        self._remember_book(key, book)
         self._book_updated.set()
 
     async def _run_binance(self, market: Market) -> None:
@@ -695,6 +740,9 @@ class PairMarketFeed:
                     url, additional_headers={"X-MBX-APIKEY": self.binance.api_key},
                     ping_interval=30.0, ping_timeout=15.0, open_timeout=10, close_timeout=3,
                 ) as ws:
+                    self._record_subscription("binance", market, {
+                        "status": "subscribed", "market_ids": list(market_ids),
+                    })
                     async for raw in ws:
                         self._handle_binance_message(raw)
                 raise ConnectionError("Binance Predict orderbook WebSocket closed")

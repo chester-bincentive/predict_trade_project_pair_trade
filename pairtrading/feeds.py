@@ -27,6 +27,7 @@ BINANCE_WS_URL = "wss://api.binance.com/sapi/wss"
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 _SLUG_RE = re.compile(r"btc-updown-5m-(\d+)")
 _LOGGER = logging.getLogger(__name__)
+BOOK_HISTORY_SECONDS = 20.0
 
 
 class FeedError(RuntimeError):
@@ -222,9 +223,15 @@ class PolymarketFeed:
         epoch = int(now.timestamp())
         base = epoch - epoch % 300
         markets: list[Market] = []
-        for start in (base - 300, base, base + 300, base + 600):
-            slug = f"btc-updown-5m-{start}"
-            response = await self.client.get(f"{GAMMA_URL}/markets", params={"slug": slug})
+        starts = (base - 300, base, base + 300, base + 600)
+        responses = await asyncio.gather(*(
+            self.client.get(
+                f"{GAMMA_URL}/markets",
+                params={"slug": f"btc-updown-5m-{start}"},
+            )
+            for start in starts
+        ))
+        for response in responses:
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, list):
@@ -534,7 +541,7 @@ class PairMarketFeed:
     def _remember_book(self, key: tuple[str, str], book: Book) -> None:
         history = self._book_history.setdefault(key, [])
         history.append(book)
-        cutoff = book.received_at.timestamp() - 30.0
+        cutoff = book.received_at.timestamp() - BOOK_HISTORY_SECONDS
         while len(history) > 1 and history[0].received_at.timestamp() < cutoff:
             history.pop(0)
 

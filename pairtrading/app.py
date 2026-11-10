@@ -121,6 +121,28 @@ class _LiveStatusLogger:
             self.last_logged_at = now
 
 
+class _FeedErrorLogger:
+    """Collapse repeated identical feed errors while preserving recovery signals."""
+
+    def __init__(self) -> None:
+        self.last_key: str | None = None
+        self.last_logged_at = 0.0
+
+    def report(self, exc: Exception) -> None:
+        now = time.monotonic()
+        key = f"{type(exc).__name__}: {exc}"
+        if key != self.last_key or now - self.last_logged_at >= LIVE_STATUS_LOG_INTERVAL_SECONDS:
+            print(f"FEED ERROR ({type(exc).__name__}): {exc}; retrying", flush=True)
+            self.last_key = key
+            self.last_logged_at = now
+
+    def recovered(self) -> None:
+        if self.last_key is not None:
+            print("FEED RECOVERED; live market data resumed.", flush=True)
+            self.last_key = None
+            self.last_logged_at = 0.0
+
+
 async def _live(settings: Settings, duration: float) -> None:
     store = Store(settings.db_path)
     run_id = uuid.uuid4().hex
@@ -154,6 +176,7 @@ async def _live(settings: Settings, duration: float) -> None:
     notifier: DiscordPnLNotifier | None = None
     notifier_task: asyncio.Task[None] | None = None
     status_logger = _LiveStatusLogger()
+    feed_error_logger = _FeedErrorLogger()
     print("SHADOW MODE ONLY | live WebSocket L2 data; zero real orders are sent to either venue.")
     print(f"rolling={settings.history_window_markets} completed markets, min={settings.min_history_markets}, "
           f"bucket={settings.bucket_seconds}s, z-entry={settings.z_entry:g}, "
@@ -204,6 +227,7 @@ async def _live(settings: Settings, duration: float) -> None:
                             status = engine.process(arrival_snapshot, evaluate_signals=False)
                             status_logger.log(arrival_snapshot, status)
                     continue
+                feed_error_logger.recovered()
                 # If a WebSocket update and an order timer race, replay every
                 # due arrival against its exact as-of memory-book snapshot first.
                 due = engine.next_wakeup_epoch()
@@ -218,7 +242,7 @@ async def _live(settings: Settings, duration: float) -> None:
                 status_logger.log(snapshot, status)
                 engine.calibration.close_completed(snapshot.captured_at)
             except (FeedError, httpx.HTTPError, OSError, TimeoutError, ValueError) as exc:
-                print(f"FEED ERROR ({type(exc).__name__}): {exc}; retrying", flush=True)
+                feed_error_logger.report(exc)
                 await asyncio.sleep(settings.poll_seconds)
     finally:
         try:

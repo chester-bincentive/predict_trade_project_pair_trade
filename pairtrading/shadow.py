@@ -72,7 +72,7 @@ class ShadowEngine:
                 self._persist()
                 self.active = None
             else:
-                result = self._advance(snapshot, snapshot_ids)
+                result = self._advance(snapshot, snapshot_ids, bucket, spread)
                 if result:
                     return result
 
@@ -90,8 +90,9 @@ class ShadowEngine:
             return "SKIP missing best bid/ask for UP midpoint"
         if elapsed >= 300.0:
             return "SKIP market has ended"
-        if (snapshot.end_at - now).total_seconds() < self.settings.hold_seconds:
-            return f"SKIP less than {self.settings.hold_seconds}s remains in matched market"
+        if (snapshot.end_at - now).total_seconds() < self.settings.min_market_time_left_seconds:
+            return ("SKIP less than "
+                    f"{self.settings.min_market_time_left_seconds}s remains in matched market")
 
         counts = self.calibration.counts(before_market_start=snapshot.start_at.timestamp())
         missing = [b for b, count in counts.items() if count < self.settings.min_history_markets]
@@ -103,8 +104,19 @@ class ShadowEngine:
         zscore = stats.score(spread)
         if zscore is None:
             return f"SKIP bucket={bucket} spread stdev is zero/undefined"
-        if abs(zscore) < self.settings.z_entry:
-            return f"HOLD bucket={bucket} spread={spread:+.4f} z={zscore:+.2f} n={stats.count}"
+        ou_stats = self.calibration.ou_stats(
+            bucket, before_market_start=snapshot.start_at.timestamp(),
+            window=self.settings.history_window_markets,
+        )
+        if ou_stats.count < self.settings.min_ou_history_markets:
+            return (f"DATA COLLECTION ONLY; bucket={bucket} has {ou_stats.count}/"
+                    f"{self.settings.min_ou_history_markets} completed-market OU samples")
+        ou_score = ou_stats.score(spread)
+        if ou_score is None:
+            return f"SKIP bucket={bucket} OU score is undefined"
+        if abs(ou_score) <= self.settings.ou_entry_threshold:
+            return (f"HOLD bucket={bucket} OU={ou_score:+.2f} z={zscore:+.2f} "
+                    f"n={ou_stats.count} model={ou_stats.method}")
         rv_q90, rv_history_n = self.calibration.rv_threshold(
             bucket, before_market_start=snapshot.start_at.timestamp(),
             window=self.settings.rv_history_window_markets,
@@ -116,24 +128,27 @@ class ShadowEngine:
         if rv10 is None:
             return f"HOLD bucket={bucket}; RV10 unavailable until two spread captures within 10s"
         if rv10 <= rv_q90:
-            return (f"HOLD bucket={bucket} z={zscore:+.2f}; RV10={rv10:.6f} <= "
+            return (f"HOLD bucket={bucket} OU={ou_score:+.2f}; RV10={rv10:.6f} <= "
                     f"historical q90={rv_q90:.6f} (n={rv_history_n})")
         if self.active is not None:
             return "HOLD existing shadow trade; no stacking"
         if self.store.has_shadow_trade(snapshot.market_key) or self.store.has_position_or_trade(snapshot.market_key):
-            return f"HOLD one-trade-per-market already used z={zscore:+.2f}"
+            return f"HOLD one-trade-per-market already used OU={ou_score:+.2f}"
 
-        if zscore < 0.0:
+        if ou_score < 0.0:
             signal, chosen = "LOW_SPREAD", (("polymarket", "UP"), ("binance", "DOWN"))
         else:
             signal, chosen = "HIGH_SPREAD", (("polymarket", "DOWN"), ("binance", "UP"))
         decision_epoch = now.timestamp()
         scenario_key = (
-            f"feed=websocket-events;retry={self.settings.poll_seconds:g};z={self.settings.z_entry:g};"
+            f"feed=websocket-events;retry={self.settings.poll_seconds:g};ou={self.settings.ou_entry_threshold:g};"
             f"roll={self.settings.history_window_markets};minhist={self.settings.min_history_markets};"
-            f"bucket={self.settings.bucket_seconds};hold={self.settings.hold_seconds};"
+            f"minou={self.settings.min_ou_history_markets};bucket={self.settings.bucket_seconds};"
+            f"ouexit={self.settings.ou_exit_threshold:g};maxhold={self.settings.max_hold_seconds};"
+            f"minleft={self.settings.min_market_time_left_seconds};"
             f"shares={self.settings.min_shares:g};fee={self.settings.taker_fee_coefficient:g};"
-            f"entry=absz>={self.settings.z_entry:g}&rv10>same-bucket-q90;"
+            f"entry=absou>{self.settings.ou_entry_threshold:g}&rv10>same-bucket-q90;"
+            "exit=directional-ou-threshold-or-maxhold;"
             f"rvroll={self.settings.rv_history_window_markets};"
             f"rvmin={self.settings.min_rv_history_markets};"
             f"poly={self.settings.poly_order_network_ms:g}+{self.settings.poly_order_api_ms:g};"
@@ -142,15 +157,21 @@ class ShadowEngine:
             "execution=latest-memory-book-at-arrival"
         )
         state: dict[str, Any] = {
-            "run_id": self.run_id,
+            "run_id": self.run_id, "exit_mode": "directional_ou_threshold",
             "market_key": snapshot.market_key, "signal": signal, "zscore": zscore,
+            "ou_score": ou_score, "ou_mean": ou_stats.mean, "ou_stdev": ou_stats.stdev,
+            "ou_phi": ou_stats.phi, "ou_model": ou_stats.method,
+            "ou_history_markets": ou_stats.count,
+            "ou_entry_threshold": self.settings.ou_entry_threshold,
+            "ou_exit_threshold": self.settings.ou_exit_threshold,
             "rv10": rv10, "rv_q90": rv_q90, "rv_history_markets": rv_history_n,
             "scenario_key": scenario_key,
-            "bucket": bucket, "history_markets": stats.count,
+            "bucket": bucket, "history_markets": ou_stats.count,
             "requested_shares": self.settings.min_shares, "decision_at": now.isoformat(),
             "decision_epoch": decision_epoch, "market_end": snapshot.end_at.timestamp(),
             "status": "OPEN", "trade_id": None, "legs": [], "entries_resolved": False,
-            "paired_shares": 0.0, "hold_due_epoch": None, "entry_cost": 0.0,
+            "paired_shares": 0.0, "max_hold_due_epoch": None, "exit_triggered": False,
+            "entry_cost": 0.0,
             "entry_fee": 0.0, "exit_value": 0.0, "exit_fee": 0.0,
         }
         for index, (venue, outcome) in enumerate(chosen):
@@ -168,7 +189,8 @@ class ShadowEngine:
             self._schedule(state, leg, "ENTRY", self.settings.min_shares, decision_epoch)
         self._persist()
         delay_text = self._delay_summary(state)
-        return (f"SHADOW SIGNAL {signal} z={zscore:+.2f} n={stats.count}; requested="
+        return (f"SHADOW SIGNAL {signal} OU={ou_score:+.2f} z={zscore:+.2f} "
+                f"n={ou_stats.count} model={ou_stats.method}; requested="
                 f"{self.settings.min_shares:g}/leg; RV10={rv10:.6f}>q90={rv_q90:.6f} "
                 f"(n={rv_history_n}); fixed-delay IOC uses memory book at arrival; "
                 f"no orders sent; {delay_text}")
@@ -279,7 +301,8 @@ class ShadowEngine:
                                  (book.received_at.timestamp() - order["arrival"]) * 1000.0, 3)})
         return filled, notional, fee
 
-    def _advance(self, snapshot: PairSnapshot, snapshot_ids: dict[tuple[str, str], int]) -> str | None:
+    def _advance(self, snapshot: PairSnapshot, snapshot_ids: dict[tuple[str, str], int],
+                 bucket: int, spread: float | None) -> str | None:
         assert self.active is not None
         state = self.active
         now = snapshot.captured_at.timestamp()
@@ -317,7 +340,15 @@ class ShadowEngine:
                 if leg["unwind_remaining"] > 1e-9:
                     leg["unwind_order"] = self._schedule(state, leg, "UNWIND", leg["unwind_remaining"], now)
             fills = [leg["entry_fill_epoch"] for leg in state["legs"] if leg["entry_fill_epoch"] is not None]
-            state["hold_due_epoch"] = None if paired <= 1e-9 else max(fills) + self.settings.hold_seconds
+            if state.get("exit_mode") == "directional_ou_threshold":
+                state["max_hold_due_epoch"] = (
+                    None if paired <= 1e-9 else max(fills) + self.settings.max_hold_seconds
+                )
+            else:
+                # Keep an already-open trade from an older version on its stored timer.
+                state["hold_due_epoch"] = (
+                    None if paired <= 1e-9 else max(fills) + self.settings.hold_seconds
+                )
             for leg in state["legs"]:
                 leg["exit_remaining"] = paired
             state["entries_resolved"] = True
@@ -348,13 +379,62 @@ class ShadowEngine:
                             wait_for_update=True,
                         )
 
+        exit_trigger_message = None
         if state["entries_resolved"] and float(state["paired_shares"]) > 1e-9:
-            if now >= float(state["hold_due_epoch"]):
-                for leg in state["legs"]:
-                    if leg["exit_order"] is None and float(leg["exit_remaining"]) > 1e-9:
-                        leg["exit_order"] = self._schedule(state, leg, "EXIT",
-                                                           float(leg["exit_remaining"]), now)
+            if state.get("exit_mode") == "directional_ou_threshold":
+                exit_ou_score = None
+                if spread is not None:
+                    ou_stats = self.calibration.ou_stats(
+                        bucket, before_market_start=snapshot.start_at.timestamp(),
+                        window=self.settings.history_window_markets,
+                    )
+                    if ou_stats.count >= self.settings.min_history_markets:
+                        exit_ou_score = ou_stats.score(spread)
+                entry_score = float(state.get("ou_score", 0.0))
+                threshold = float(state.get("ou_exit_threshold", self.settings.ou_exit_threshold))
+                crossed = (
+                    exit_ou_score is not None
+                    and (exit_ou_score >= -threshold if entry_score < 0.0
+                         else exit_ou_score <= threshold)
+                )
+                max_hold_due = state.get("max_hold_due_epoch")
+                max_hold_reached = max_hold_due is not None and now >= float(max_hold_due)
+                if not state.get("exit_triggered") and (crossed or max_hold_reached):
+                    reason = "ou_threshold" if crossed else "max_hold"
+                    state["exit_triggered"] = True
+                    state["exit_reason"] = reason
+                    state["exit_trigger_epoch"] = now
+                    state["exit_trigger_ou_score"] = exit_ou_score
+                    status = "OU_EXIT_TRIGGERED" if crossed else "MAX_HOLD_EXIT_TRIGGERED"
+                    self._event(
+                        state, "EXIT_RULE", None, side=None, status=status,
+                        details={"reason": reason, "ou_score": exit_ou_score,
+                                 "exit_threshold": threshold,
+                                 "max_hold_seconds": self.settings.max_hold_seconds},
+                    )
+                    exit_trigger_message = (
+                        f"SHADOW EXIT TRIGGER {reason}; OU="
+                        f"{exit_ou_score:+.2f}" if exit_ou_score is not None
+                        else f"SHADOW EXIT TRIGGER {reason}; OU unavailable"
+                    )
                     dirty = True
+                if state.get("exit_triggered"):
+                    for leg in state["legs"]:
+                        if leg["exit_order"] is None and float(leg["exit_remaining"]) > 1e-9:
+                            leg["exit_order"] = self._schedule(
+                                state, leg, "EXIT", float(leg["exit_remaining"]), now
+                            )
+                            dirty = True
+            else:
+                legacy_due = state.get("hold_due_epoch")
+                if (legacy_due is not None and now >= float(legacy_due)
+                        and all(leg["exit_order"] is None for leg in state["legs"])):
+                    for leg in state["legs"]:
+                        if float(leg["exit_remaining"]) > 1e-9:
+                            leg["exit_order"] = self._schedule(
+                                state, leg, "EXIT", float(leg["exit_remaining"]), now
+                            )
+                            dirty = True
             for leg in state["legs"]:
                 remaining = float(leg["exit_remaining"])
                 order = leg.get("exit_order")
@@ -405,9 +485,21 @@ class ShadowEngine:
             return (f"SHADOW SINGLE-LEG EXPOSURE; paired={state['paired_shares']:g}, "
                     f"unwind pending; IOC retry waits for a new book after 330ms arrival")
         if state["paired_shares"] > 1e-9:
+            if state.get("exit_mode") == "directional_ou_threshold":
+                if state.get("exit_triggered"):
+                    return exit_trigger_message or (
+                        f"SHADOW EXIT pending paired={state['paired_shares']:g}; "
+                        "waiting for 330ms order arrival"
+                    )
+                due = state.get("max_hold_due_epoch")
+                left = None if due is None else max(0.0, float(due) - now)
+                return (f"SHADOW OPEN paired={state['paired_shares']:g}; waiting for directional "
+                        f"OU exit at ±{self.settings.ou_exit_threshold:g}; "
+                        f"max hold in {left:.1f}s" if left is not None
+                        else f"SHADOW OPEN paired={state['paired_shares']:g}; waiting for OU exit")
             due = state.get("hold_due_epoch")
             if due is not None and now < float(due):
-                return f"SHADOW OPEN paired={state['paired_shares']:g}; hold {float(due)-now:.1f}s then delayed exit"
+                return f"SHADOW OPEN paired={state['paired_shares']:g}; legacy timer {float(due)-now:.1f}s"
             return f"SHADOW EXIT pending paired={state['paired_shares']:g}; waiting for 330ms order arrival"
         return "SHADOW NO PAIR; entry filled zero; recording complete"
 
@@ -433,9 +525,12 @@ class ShadowEngine:
                         and not order.get("wait_for_update", False)):
                     due.append(float(order["arrival"]))
         if (state.get("entries_resolved") and float(state.get("paired_shares", 0.0)) > 1e-9
-                and state.get("hold_due_epoch") is not None
                 and all(leg.get("exit_order") is None for leg in state["legs"])):
-            due.append(float(state["hold_due_epoch"]))
+            if state.get("exit_mode") == "directional_ou_threshold":
+                if not state.get("exit_triggered") and state.get("max_hold_due_epoch") is not None:
+                    due.append(float(state["max_hold_due_epoch"]))
+            elif state.get("hold_due_epoch") is not None:
+                due.append(float(state["hold_due_epoch"]))
         return min(due) if due else None
 
     @staticmethod

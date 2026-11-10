@@ -150,10 +150,16 @@ async def _live(settings: Settings, duration: float) -> None:
     store.record_runtime_event(
         run_id=run_id, event_type="run_started",
         details={
-            "mode": "live_shadow", "z_entry": settings.z_entry,
+            "mode": "live_shadow",
+            "ou_entry_threshold": settings.ou_entry_threshold,
+            "ou_exit_threshold": settings.ou_exit_threshold,
+            "min_ou_history_markets": settings.min_ou_history_markets,
             "spread_history_window_markets": settings.history_window_markets,
+            "min_history_markets": settings.min_history_markets,
             "rv_history_window_markets": settings.rv_history_window_markets,
             "min_rv_history_markets": settings.min_rv_history_markets,
+            "min_market_time_left_seconds": settings.min_market_time_left_seconds,
+            "max_hold_seconds": settings.max_hold_seconds,
             "shares_per_leg": settings.min_shares,
             "fee_coefficient": settings.taker_fee_coefficient,
             "max_quote_age_seconds": settings.max_quote_age_seconds,
@@ -178,12 +184,17 @@ async def _live(settings: Settings, duration: float) -> None:
     status_logger = _LiveStatusLogger()
     feed_error_logger = _FeedErrorLogger()
     print("SHADOW MODE ONLY | live WebSocket L2 data; zero real orders are sent to either venue.")
-    print(f"rolling={settings.history_window_markets} completed markets, min={settings.min_history_markets}, "
-          f"bucket={settings.bucket_seconds}s, z-entry={settings.z_entry:g}, "
-          f"hold={settings.hold_seconds}s, min-shares={settings.min_shares:g}, fee=%.3g*p*(1-p)" % settings.taker_fee_coefficient)
-    print(f"Entry filter: |z| >= {settings.z_entry:g} and RV10 > same-bucket historical q90 "
+    print(f"rolling={settings.history_window_markets} completed markets, "
+          f"min-spread-history={settings.min_history_markets}, "
+          f"min-OU-history={settings.min_ou_history_markets}, bucket={settings.bucket_seconds}s, "
+          f"shares={settings.min_shares:g}, fee=%.3g*p*(1-p)" % settings.taker_fee_coefficient)
+    print(f"Entry filter: |OU score| > {settings.ou_entry_threshold:g} and "
+          "RV10 > same-bucket historical q90 "
           f"(last {settings.rv_history_window_markets} completed markets; "
           f"minimum {settings.min_rv_history_markets}).")
+    print(f"Exit rule: directional OU score returns to ±{settings.ou_exit_threshold:g}; "
+          f"maximum hold {settings.max_hold_seconds}s; entry requires at least "
+          f"{settings.min_market_time_left_seconds}s left in the market.")
     print("Paper fill events retain WebSocket source-data age; raw quote/orderbook snapshots are not stored. "
           "Order-book request RTT is unavailable from the stream.")
     print("Simulated order delay: fixed 330ms from submit to arrival, with no jitter.")
@@ -291,18 +302,23 @@ def main() -> None:
                 rv_window=settings.rv_history_window_markets,
                 bucket_seconds=settings.bucket_seconds,
             )
-            rows = store.history_status()
+            spread_rows = {bucket: (count, latest) for bucket, count, latest in store.history_status()}
             rv_rows = {bucket: (count, latest) for bucket, count, latest in
                        store.rv_history_status(before_market_start=time.time())}
             print(f"Calibration database: {settings.db_path}")
-            for bucket, count, latest in rows:
+            bucket_count = (300 + settings.bucket_seconds - 1) // settings.bucket_seconds
+            for bucket in range(bucket_count):
+                count, latest = spread_rows.get(bucket, (0, None))
                 last_text = "none" if latest is None else datetime.fromtimestamp(latest, timezone.utc).isoformat()
                 state = "READY" if count >= settings.min_history_markets else "WARMUP"
+                ou_state = "READY" if count >= settings.min_ou_history_markets else "WARMUP"
                 bucket_end = min(300, (bucket + 1) * settings.bucket_seconds)
                 print(f"bucket {bucket} ({bucket * settings.bucket_seconds}-{bucket_end}s): "
-                      f"stored={count}; rolling-window={min(count, settings.history_window_markets)}/"
-                      f"{settings.history_window_markets}; {state}; latest={last_text}")
-            for bucket in range((300 + settings.bucket_seconds - 1) // settings.bucket_seconds):
+                      f"spread-history={min(count, settings.history_window_markets)}/"
+                      f"{settings.history_window_markets} ({state}); "
+                      f"OU-entry-history={min(count, settings.history_window_markets)}/"
+                      f"{settings.min_ou_history_markets} ({ou_state}); latest={last_text}")
+            for bucket in range(bucket_count):
                 count, latest = rv_rows.get(bucket, (0, None))
                 state = "READY" if count >= settings.min_rv_history_markets else "WARMUP"
                 latest_text = "none" if latest is None else datetime.fromtimestamp(
@@ -312,7 +328,7 @@ def main() -> None:
                       f"{min(count, settings.rv_history_window_markets)}/"
                       f"{settings.rv_history_window_markets}; min={settings.min_rv_history_markets}; "
                       f"{state}; latest={latest_text}")
-            if not rows:
+            if not any(count for count, _ in spread_rows.values()):
                 print("No spread calibration history yet. Run live mode to collect market data.")
         finally:
             store.close()

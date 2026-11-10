@@ -180,12 +180,17 @@ def demo(settings: Settings) -> None:
             match_tolerance_seconds=settings.match_tolerance_seconds,
             max_quote_age_seconds=settings.max_quote_age_seconds,
             z_entry=settings.z_entry,
+            ou_entry_threshold=settings.ou_entry_threshold,
+            ou_exit_threshold=settings.ou_exit_threshold,
             min_history_markets=settings.min_history_markets,
             history_window_markets=settings.history_window_markets,
+            min_ou_history_markets=settings.min_ou_history_markets,
             min_rv_history_markets=settings.min_rv_history_markets,
             rv_history_window_markets=settings.rv_history_window_markets,
             bucket_seconds=settings.bucket_seconds,
             hold_seconds=settings.hold_seconds,
+            min_market_time_left_seconds=settings.min_market_time_left_seconds,
+            max_hold_seconds=settings.max_hold_seconds,
             min_shares=settings.min_shares,
             taker_fee_coefficient=settings.taker_fee_coefficient,
             poly_order_network_ms=settings.poly_order_network_ms,
@@ -230,6 +235,8 @@ def demo(settings: Settings) -> None:
         # Synthetic closed-market medians are isolated demo fixtures, never live history.
         bucket_count = (300 + demo_settings.bucket_seconds - 1) // demo_settings.bucket_seconds
         seed_count = max(100, demo_settings.min_history_markets,
+                         demo_settings.history_window_markets,
+                         demo_settings.min_ou_history_markets,
                          demo_settings.rv_history_window_markets,
                          demo_settings.min_rv_history_markets)
         for bucket in range(bucket_count):
@@ -256,18 +263,15 @@ def demo(settings: Settings) -> None:
         print("ENTRY ARRIVAL (same already-received memory books; no new quote):",
               engine.process(entry_arrival_snapshot, evaluate_signals=False))
 
-        hold_due = (float(engine.active["hold_due_epoch"]) if engine.active is not None
-                    and engine.active.get("hold_due_epoch") is not None
-                    else entry_arrival.timestamp() + demo_settings.hold_seconds)
-        exit_at = datetime.fromtimestamp(hold_due, tz=timezone.utc)
+        exit_at = entry_arrival + timedelta(seconds=10)
         exit_books = {
-            ("polymarket", "UP"): make_book("polymarket", "UP", "pu", .38, .40, exit_at),
-            ("polymarket", "DOWN"): make_book("polymarket", "DOWN", "pd", .60, .62, exit_at),
-            ("binance", "UP"): make_book("binance", "UP", "bu", .65, .67, exit_at),
-            ("binance", "DOWN"): make_book("binance", "DOWN", "bd", .33, .35, exit_at),
+            ("polymarket", "UP"): make_book("polymarket", "UP", "pu", .49, .51, exit_at),
+            ("polymarket", "DOWN"): make_book("polymarket", "DOWN", "pd", .49, .51, exit_at),
+            ("binance", "UP"): make_book("binance", "UP", "bu", .49, .51, exit_at),
+            ("binance", "DOWN"): make_book("binance", "DOWN", "bd", .49, .51, exit_at),
         }
-        exit_snapshot = PairSnapshot(market_key, poly, binance, exit_books, exit_at, 0.0)
-        print("EXIT SUBMIT:", engine.process(exit_snapshot, evaluate_signals=False))
+        exit_trigger_snapshot = PairSnapshot(market_key, poly, binance, exit_books, exit_at, 0.0)
+        print("OU EXIT TRIGGER:", engine.process(exit_trigger_snapshot, evaluate_signals=False))
         exit_arrival = exit_at + timedelta(seconds=delay_seconds)
         exit_arrival_snapshot = PairSnapshot(
             market_key, poly, binance, exit_books, exit_arrival, 0.0

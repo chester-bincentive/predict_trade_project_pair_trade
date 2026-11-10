@@ -12,13 +12,20 @@ class Settings:
     poll_seconds: float = 1.0
     match_tolerance_seconds: float = 2.0
     max_quote_age_seconds: float = 3.0
+    # Legacy threshold retained only for the deprecated immediate-fill engine.
     z_entry: float = 2.5
+    ou_entry_threshold: float = 3.0
+    ou_exit_threshold: float = 1.5
     min_history_markets: int = 50
-    history_window_markets: int = 200
+    history_window_markets: int = 100
+    min_ou_history_markets: int = 100
     min_rv_history_markets: int = 100
     rv_history_window_markets: int = 100
     bucket_seconds: int = 60
+    # Legacy fixed-hold setting retained for the deprecated immediate-fill engine.
     hold_seconds: int = 20
+    min_market_time_left_seconds: int = 20
+    max_hold_seconds: int = 60
     min_shares: float = 5.0
     taker_fee_coefficient: float = 0.07
     # Fixed 330ms total assumed delay; keep the legacy components for stored scenarios.
@@ -40,12 +47,17 @@ class Settings:
             match_tolerance_seconds=_float_env("PAIR_MATCH_TOLERANCE_SECONDS", 2.0, minimum=0.0),
             max_quote_age_seconds=_float_env("PAIR_MAX_QUOTE_AGE_SECONDS", 3.0, minimum=0.1),
             z_entry=_float_env("PAIR_Z_ENTRY", 2.5, minimum=0.1),
+            ou_entry_threshold=_float_env("PAIR_OU_ENTRY_THRESHOLD", 3.0, minimum=0.1),
+            ou_exit_threshold=_float_env("PAIR_OU_EXIT_THRESHOLD", 1.5, minimum=0.1),
             min_history_markets=_int_env("PAIR_MIN_HISTORY_MARKETS", 50, minimum=2),
-            history_window_markets=_int_env("PAIR_HISTORY_WINDOW_MARKETS", 200, minimum=2),
+            history_window_markets=_int_env("PAIR_HISTORY_WINDOW_MARKETS", 100, minimum=2),
+            min_ou_history_markets=_int_env("PAIR_MIN_OU_HISTORY_MARKETS", 100, minimum=2),
             min_rv_history_markets=_int_env("PAIR_MIN_RV_HISTORY_MARKETS", 100, minimum=2),
             rv_history_window_markets=_int_env("PAIR_RV_HISTORY_WINDOW_MARKETS", 100, minimum=2),
             bucket_seconds=_int_env("PAIR_BUCKET_SECONDS", 60, minimum=1),
             hold_seconds=_int_env("PAIR_HOLD_SECONDS", 20, minimum=1),
+            min_market_time_left_seconds=_int_env("PAIR_MIN_MARKET_TIME_LEFT_SECONDS", 20, minimum=1),
+            max_hold_seconds=_int_env("PAIR_MAX_HOLD_SECONDS", 60, minimum=1),
             min_shares=_float_env("PAIR_MIN_SHARES", 5.0, minimum=1.0),
             taker_fee_coefficient=_float_env("PAIR_TAKER_FEE_COEFFICIENT", 0.07, minimum=0.0),
             poly_order_network_ms=_float_env("PAIR_POLY_ORDER_NETWORK_MS", 330.0, minimum=0.0),
@@ -61,8 +73,12 @@ class Settings:
         )
         if settings.min_history_markets > settings.history_window_markets:
             raise ValueError("PAIR_MIN_HISTORY_MARKETS cannot exceed PAIR_HISTORY_WINDOW_MARKETS")
+        if settings.min_ou_history_markets > settings.history_window_markets:
+            raise ValueError("PAIR_MIN_OU_HISTORY_MARKETS cannot exceed PAIR_HISTORY_WINDOW_MARKETS")
         if settings.min_rv_history_markets > settings.rv_history_window_markets:
             raise ValueError("PAIR_MIN_RV_HISTORY_MARKETS cannot exceed PAIR_RV_HISTORY_WINDOW_MARKETS")
+        if settings.ou_exit_threshold >= settings.ou_entry_threshold:
+            raise ValueError("PAIR_OU_EXIT_THRESHOLD must be below PAIR_OU_ENTRY_THRESHOLD")
         return settings
 
 

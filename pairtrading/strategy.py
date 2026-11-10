@@ -24,6 +24,44 @@ class ZStats:
         return (value - self.mean) / self.stdev
 
 
+@dataclass(frozen=True, slots=True)
+class OUStats:
+    count: int
+    mean: float | None
+    stdev: float | None
+    phi: float | None
+    method: str
+
+    def score(self, value: float) -> float | None:
+        if self.mean is None or self.stdev is None or self.stdev <= 1e-12:
+            return None
+        return (value - self.mean) / self.stdev
+
+
+def _fit_ou(values: list[float]) -> tuple[float, float, float] | None:
+    """Fit AR(1) to completed-market bucket medians as in the archive replay."""
+    if len(values) < 4:
+        return None
+    x, y = values[:-1], values[1:]
+    mean_x = statistics.mean(x)
+    mean_y = statistics.mean(y)
+    covariance = sum((a - mean_x) * (b - mean_y) for a, b in zip(x, y))
+    variance_x = sum((a - mean_x) ** 2 for a in x)
+    if variance_x <= 1e-14:
+        return None
+    phi = covariance / variance_x
+    if not math.isfinite(phi) or abs(phi) >= 0.999:
+        return None
+    intercept = mean_y - phi * mean_x
+    mean = intercept / (1.0 - phi)
+    sse = sum((b - intercept - phi * a) ** 2 for a, b in zip(x, y))
+    innovation_sd = math.sqrt(sse / max(1, len(x) - 2))
+    stationary_sd = innovation_sd / math.sqrt(1.0 - phi * phi)
+    if not math.isfinite(stationary_sd) or stationary_sd <= 1e-12:
+        return None
+    return mean, stationary_sd, phi
+
+
 class _RV10Accumulator:
     """sqrt(sum of squared adjacent spread changes over the trailing 10s)."""
 
@@ -81,6 +119,7 @@ class RollingCalibration:
         self._samples: dict[int, list[float]] = defaultdict(list)
         self._rv_samples: dict[int, list[float]] = defaultdict(list)
         self._rv = _RV10Accumulator()
+        self._ou_cache: dict[tuple[int, float, int], OUStats] = {}
         if not store.rv_history_backfill_disabled():
             self._backfill_rv_history()
         store.prune_calibration_history(spread_window=self.window, rv_window=self.rv_window)
@@ -157,6 +196,38 @@ class RollingCalibration:
         if len(values) < 2:
             return ZStats(len(values), None, None)
         return ZStats(len(values), statistics.mean(values), statistics.stdev(values))
+
+    def ou_stats(self, bucket: int, *, before_market_start: float, window: int | None = None) -> OUStats:
+        """Return the replay's stationary AR(1) score parameters for one bucket.
+
+        Bucket 0 intentionally uses the unconditional z-score. Other buckets use
+        an AR(1) stationary mean and standard deviation, falling back to z-score
+        parameters when the fit is unavailable, matching the replay implementation.
+        """
+        lookback = self.window if window is None else window
+        key = (bucket, before_market_start, lookback)
+        cached = self._ou_cache.get(key)
+        if cached is not None:
+            return cached
+        rows = self.store.history(bucket, before_market_start=before_market_start, limit=lookback)
+        values = [row[2] for row in reversed(rows)]
+        count = len(values)
+        if count < 2:
+            result = OUStats(count, None, None, None, "unavailable")
+        else:
+            fallback_mean = statistics.mean(values)
+            fallback_sd = statistics.stdev(values)
+            fit = None if bucket == 0 else _fit_ou(values)
+            if fit is None:
+                result = OUStats(
+                    count, fallback_mean, fallback_sd, None,
+                    "unconditional_z" if bucket == 0 else "z_fallback",
+                )
+            else:
+                mean, stationary_sd, phi = fit
+                result = OUStats(count, mean, stationary_sd, phi, "ar1_stationary")
+        self._ou_cache[key] = result
+        return result
 
     def counts(self, *, before_market_start: float) -> dict[int, int]:
         return {

@@ -67,6 +67,60 @@ def _line(snapshot, message: str) -> str:
             f"BinUP {side(bu, 'best_bid')}/{side(bu, 'best_ask')}  S={spread}  {message}")
 
 
+LIVE_STATUS_LOG_INTERVAL_SECONDS = 60.0
+LIVE_STATUS_CHANGE_LOG_INTERVAL_SECONDS = 5.0
+
+
+def _status_log_key(message: str) -> str:
+    if message.startswith("SKIP stale quotes:"):
+        return "SKIP stale quotes"
+    if message.startswith("DATA COLLECTION ONLY; insufficient closed-market history"):
+        return "DATA COLLECTION ONLY; insufficient closed-market history"
+    if message.startswith("DATA COLLECTION ONLY; bucket="):
+        return message.split(" has ", 1)[0]
+    if message.startswith("SHADOW ENTRY pending"):
+        return message.split(";", 1)[0]
+    for prefix in (
+        "SHADOW OPEN",
+        "SHADOW SINGLE-LEG EXPOSURE",
+        "SHADOW EXIT pending",
+    ):
+        if message.startswith(prefix):
+            return prefix
+    if message.startswith("OPEN shadow trade"):
+        return message.split(";", 1)[0]
+    return message
+
+
+class _LiveStatusLogger:
+    """Keep live snapshots useful without logging every WebSocket update."""
+
+    def __init__(self) -> None:
+        self.last_key: str | None = None
+        self.last_logged_at = 0.0
+
+    def log(self, snapshot, message: str) -> None:
+        now = time.monotonic()
+        key = _status_log_key(message)
+        changed = key != self.last_key
+        heartbeat_due = now - self.last_logged_at >= LIVE_STATUS_LOG_INTERVAL_SECONDS
+        important_change = changed and key.startswith((
+            "SHADOW ENTRY",
+            "SHADOW SINGLE-LEG",
+            "SHADOW OPEN",
+            "SHADOW EXIT",
+            "SHADOW CLOSED",
+            "SHADOW NO PAIR",
+            "SHADOW UNRESOLVED",
+            "OPEN shadow trade",
+        ))
+        ordinary_change_due = changed and now - self.last_logged_at >= LIVE_STATUS_CHANGE_LOG_INTERVAL_SECONDS
+        if self.last_key is None or heartbeat_due or important_change or ordinary_change_due:
+            print(_line(snapshot, message), flush=True)
+            self.last_key = key
+            self.last_logged_at = now
+
+
 async def _live(settings: Settings, duration: float) -> None:
     store = Store(settings.db_path)
     run_id = uuid.uuid4().hex
@@ -99,6 +153,7 @@ async def _live(settings: Settings, duration: float) -> None:
     next_clock_sync = start + 3600.0
     notifier: DiscordPnLNotifier | None = None
     notifier_task: asyncio.Task[None] | None = None
+    status_logger = _LiveStatusLogger()
     print("SHADOW MODE ONLY | live WebSocket L2 data; zero real orders are sent to either venue.")
     print(f"rolling={settings.history_window_markets} completed markets, min={settings.min_history_markets}, "
           f"bucket={settings.bucket_seconds}s, z-entry={settings.z_entry:g}, "
@@ -134,7 +189,7 @@ async def _live(settings: Settings, duration: float) -> None:
                     arrival_snapshot = feed.snapshot_at(due)
                     if arrival_snapshot is not None:
                         status = engine.process(arrival_snapshot, evaluate_signals=False)
-                        print(_line(arrival_snapshot, status), flush=True)
+                        status_logger.log(arrival_snapshot, status)
                         continue
                 until_due = 1.0 if due is None or due <= wall_now else due - wall_now
                 timeout = min(1.0, until_due)
@@ -147,7 +202,7 @@ async def _live(settings: Settings, duration: float) -> None:
                         arrival_snapshot = feed.snapshot_at(due)
                         if arrival_snapshot is not None:
                             status = engine.process(arrival_snapshot, evaluate_signals=False)
-                            print(_line(arrival_snapshot, status), flush=True)
+                            status_logger.log(arrival_snapshot, status)
                     continue
                 # If a WebSocket update and an order timer race, replay every
                 # due arrival against its exact as-of memory-book snapshot first.
@@ -157,10 +212,10 @@ async def _live(settings: Settings, duration: float) -> None:
                     if arrival_snapshot is None:
                         break
                     status = engine.process(arrival_snapshot, evaluate_signals=False)
-                    print(_line(arrival_snapshot, status), flush=True)
+                    status_logger.log(arrival_snapshot, status)
                     due = engine.next_wakeup_epoch()
                 status = engine.process(snapshot)
-                print(_line(snapshot, status), flush=True)
+                status_logger.log(snapshot, status)
                 engine.calibration.close_completed(snapshot.captured_at)
             except (FeedError, httpx.HTTPError, OSError, TimeoutError, ValueError) as exc:
                 print(f"FEED ERROR ({type(exc).__name__}): {exc}; retrying", flush=True)

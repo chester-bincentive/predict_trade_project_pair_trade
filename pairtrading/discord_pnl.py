@@ -39,13 +39,13 @@ class DiscordPnLNotifier:
         session_pnl = stats["pnl"] - self.baseline["pnl"]
         message = "\n".join(
             (
-                "**BTC 5 分鐘配對交易｜Shadow 損益**",
+                "**BTC 5 分鐘 Polymarket 單腿 Shadow 損益**",
                 f"更新時間（UTC）：{datetime.now(timezone.utc).isoformat(timespec='seconds')}",
                 f"本次啟動後：已實現 ${session_pnl:+.4f}｜完成 {session_count} 筆｜"
                 f"勝率 {self._win_rate(session_wins, session_count)}",
                 f"資料庫累計：已實現 ${stats['pnl']:+.4f}｜完成 {stats['completed']} 筆｜"
                 f"勝率 {self._win_rate(stats['wins'], stats['completed'])}",
-                f"目前交易：未平倉 {stats['open']}｜未解決 {stats['unresolved']}｜未配對 {stats['no_pair']}",
+                f"目前交易：未平倉 {stats['open']}｜未解決 {stats['unresolved']}｜未建立持倉 {stats['no_position']}",
                 "Shadow mode；不會送出真實訂單。",
             )
         )
@@ -57,7 +57,7 @@ class DiscordPnLNotifier:
         rows = self.store.shadow_trade_rows()
         completed = [
             row for row in rows
-            if row["status"] in {"CLOSED", "NO_PAIR"} and row["net_pnl"] is not None
+            if row["status"] in {"CLOSED", "NO_PAIR", "NO_POSITION"} and row["net_pnl"] is not None
         ]
         pnls = [float(row["net_pnl"]) for row in completed]
         return {
@@ -66,7 +66,7 @@ class DiscordPnLNotifier:
             "wins": sum(pnl > 0 for pnl in pnls),
             "open": sum(row["status"] == "OPEN" for row in rows),
             "unresolved": sum(str(row["status"]).startswith("UNRESOLVED") for row in rows),
-            "no_pair": sum(row["status"] == "NO_PAIR" for row in rows),
+            "no_position": sum(row["status"] in {"NO_PAIR", "NO_POSITION"} for row in rows),
         }
 
     @staticmethod

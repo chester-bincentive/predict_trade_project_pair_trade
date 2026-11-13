@@ -23,7 +23,7 @@ from .strategy import RollingCalibration
 
 
 def _arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="BTC 5-minute Polymarket x Binance Predict shadow pair-trading demo")
+    parser = argparse.ArgumentParser(description="BTC 5-minute Polymarket single-leg shadow-trading demo")
     parser.add_argument("mode", choices=("demo", "live", "import-history", "history-status", "clear-history", "report"), nargs="?", default="demo")
     parser.add_argument("--history-csv", type=Path, help="normalized closed-market bucket medians CSV")
     parser.add_argument("--duration-seconds", type=float, default=0.0, help="stop live shadow scan after N seconds; 0 runs until Ctrl+C")
@@ -83,6 +83,7 @@ def _status_log_key(message: str) -> str:
     for prefix in (
         "SHADOW OPEN",
         "SHADOW SINGLE-LEG EXPOSURE",
+        "SHADOW NO POSITION",
         "SHADOW EXIT pending",
     ):
         if message.startswith(prefix):
@@ -111,6 +112,7 @@ class _LiveStatusLogger:
             "SHADOW EXIT",
             "SHADOW CLOSED",
             "SHADOW NO PAIR",
+            "SHADOW NO POSITION",
             "SHADOW UNRESOLVED",
             "OPEN shadow trade",
         ))
@@ -160,7 +162,8 @@ async def _live(settings: Settings, duration: float) -> None:
             "min_rv_history_markets": settings.min_rv_history_markets,
             "min_market_time_left_seconds": settings.min_market_time_left_seconds,
             "max_hold_seconds": settings.max_hold_seconds,
-            "shares_per_leg": settings.min_shares,
+            "execution_mode": "polymarket_only",
+            "shares_per_order": settings.min_shares,
             "fee_coefficient": settings.taker_fee_coefficient,
             "max_quote_age_seconds": settings.max_quote_age_seconds,
             "order_delay_ms": {
@@ -183,7 +186,7 @@ async def _live(settings: Settings, duration: float) -> None:
     notifier_task: asyncio.Task[None] | None = None
     status_logger = _LiveStatusLogger()
     feed_error_logger = _FeedErrorLogger()
-    print("SHADOW MODE ONLY | live WebSocket L2 data; zero real orders are sent to either venue.")
+    print("SHADOW MODE ONLY | Polymarket single-leg paper positions; Binance supplies signal data only; no real orders are sent.")
     print(f"rolling={settings.history_window_markets} completed markets, "
           f"min-spread-history={settings.min_history_markets}, "
           f"min-OU-history={settings.min_ou_history_markets}, bucket={settings.bucket_seconds}s, "
@@ -355,14 +358,14 @@ def main() -> None:
             total = len(rows)
             scenario_keys = sorted({str(row["scenario_key"]) for row in rows})
             closed = [row for row in rows if row["status"] == "CLOSED"]
-            completed = [row for row in rows if row["status"] in {"CLOSED", "NO_PAIR"}
+            completed = [row for row in rows if row["status"] in {"CLOSED", "NO_PAIR", "NO_POSITION"}
                          and row["net_pnl"] is not None]
-            no_pair = sum(row["status"] == "NO_PAIR" for row in rows)
+            no_position = sum(row["status"] in {"NO_PAIR", "NO_POSITION"} for row in rows)
             unresolved = sum(str(row["status"]).startswith("UNRESOLVED") for row in rows)
-            full = sum(float(row["paired_shares"]) + 1e-9 >= float(row["requested_shares"])
-                       for row in rows if float(row["requested_shares"]) > 0)
-            any_pair = sum(float(row["paired_shares"]) > 1e-9 for row in rows)
-            mean_pair_ratio = (sum(min(1.0, float(row["paired_shares"]) / float(row["requested_shares"]))
+            full_size = sum(float(row["paired_shares"]) + 1e-9 >= float(row["requested_shares"])
+                            for row in rows if float(row["requested_shares"]) > 0)
+            any_position = sum(float(row["paired_shares"]) > 1e-9 for row in rows)
+            mean_fill_ratio = (sum(min(1.0, float(row["paired_shares"]) / float(row["requested_shares"]))
                                    for row in rows if float(row["requested_shares"]) > 0) / total) if total else None
             closed_pnls = [float(row["net_pnl"]) for row in completed]
             win_rate = (sum(pnl > 0 for pnl in closed_pnls) / len(closed_pnls)) if closed_pnls else None
@@ -373,11 +376,11 @@ def main() -> None:
                     day = datetime.fromtimestamp(float(row["decision_epoch"]), timezone.utc).date().isoformat()
                     daily[day].append(float(row["net_pnl"]))
             print(f"Shadow report: {settings.db_path}")
-            print(f"Signals={total}; at least some paired={any_pair}/{total}; fully paired={full}/{total}; "
-                  f"NO_PAIR={no_pair}; unresolved at market end={unresolved}")
+            print(f"Signals={total}; position opened={any_position}/{total}; full requested size={full_size}/{total}; "
+                  f"no position={no_position}; unresolved at market end={unresolved}")
             for scenario in scenario_keys:
                 group = [row for row in rows if row["scenario_key"] == scenario]
-                group_done = [row for row in group if row["status"] in {"CLOSED", "NO_PAIR"}
+                group_done = [row for row in group if row["status"] in {"CLOSED", "NO_PAIR", "NO_POSITION"}
                               and row["net_pnl"] is not None]
                 group_pnls = [float(row["net_pnl"]) for row in group_done]
                 group_rate = (sum(value > 0 for value in group_pnls) / len(group_pnls)) if group_pnls else None
@@ -387,12 +390,12 @@ def main() -> None:
                       f"Scenario [{scenario}] trades={len(group)}; completed=0; PnL=n/a")
                 if group_rate is not None:
                     print(f"  win rate={group_rate:.1%}")
-            print(f"Mean pair fill ratio={mean_pair_ratio:.1%}" if mean_pair_ratio is not None
-                  else "Mean pair fill ratio: n/a")
+            print(f"Mean requested-size fill ratio={mean_fill_ratio:.1%}" if mean_fill_ratio is not None
+                  else "Mean requested-size fill ratio: n/a")
             if closed_pnls:
                 print(f"Closed-only net PnL: total={sum(closed_pnls):+.4f}; mean/trade={mean_pnl:+.4f}; "
                       f"win rate={win_rate:.1%}; completed trades={len(closed_pnls)} "
-                      f"(paired exits={len(closed)}, no-pair/unwind={no_pair})")
+                      f"(closed positions={len(closed)}, no-position records={no_position})")
                 print("Daily closed PnL (UTC): " + "; ".join(
                     f"{day} {sum(values):+.4f} ({len(values)} trades, "
                     f"{sum(value > 0 for value in values)/len(values):.0%} wins)"

@@ -1,8 +1,8 @@
-# BTC 5 分鐘跨平台配對交易 Demo
+# BTC 5 分鐘跨平台訊號 Polymarket 單腿 Shadow Trade Demo
 
-這是獨立資料夾中的初版系統：配對 Polymarket 與 Binance Wallet Predict 同一個 BTC 5 分鐘區間，讀取兩邊 UP/DOWN 完整可見 order book，計算 walk-forward spread Z-score，並用 shadow execution 模擬延遲後的雙腿進出場。
+這是獨立資料夾中的初版系統：讀取 Polymarket 與 Binance Wallet Predict 同一個 BTC 5 分鐘區間的行情，計算 walk-forward spread 與 OU score，再以 shadow execution 模擬只在 Polymarket 建立單腿部位。Binance 行情仍用於訊號計算，不送出或模擬 Binance 訂單。
 
-`live` 是即時行情 paper/shadow mode：order book 只在記憶體中供策略與成交模擬使用；資料庫保存訊號決策、紙上訂單嘗試與成交、費用與損益，以及市場訂閱和程式啟停事件。為了跨重啟維持策略校準，另保留每個 bucket 最近 200 筆 spread 中位數與 100 筆 RV10 中位數；不保存逐筆行情或完整深度。不會建立或送出任何真實訂單。
+`live` 是即時行情 paper/shadow mode：order book 只在記憶體中供策略與 Polymarket 成交模擬使用；資料庫保存訊號決策、紙上訂單嘗試與成交、費用與損益，以及市場訂閱和程式啟停事件。為了跨重啟維持策略校準，另保留每個 bucket 最近 200 筆 spread 中位數與 100 筆 RV10 中位數；不保存逐筆行情或完整深度。不會建立或送出任何真實訂單。
 `demo` 與公開的 `PaperEngine` 也使用相同的延遲到達成交邏輯。
 
 ## 執行
@@ -37,7 +37,7 @@ Copy-Item .env.example .env
 
 Discord 損益推送是選用功能：在 Discord 目標伺服器的「伺服器設定 → 整合 → Webhooks」建立 incoming webhook，選擇要接收訊息的頻道，再複製 webhook URL 到 `.env` 的 `PAIR_DISCORD_WEBHOOK_URL`。程式啟動後會立即推送摘要，再依 `PAIR_DISCORD_PNL_INTERVAL_SECONDS` 定期推送；預設每 900 秒（15 分鐘），最短可設 60 秒。摘要包含本次啟動後新增的已實現損益、資料庫累計損益、完成筆數、勝率、未平倉和未解決筆數。Webhook 欄位留白就不推送。Webhook URL 等同密碼，請勿分享或提交 `.env`；`.gitignore` 已排除 `.env`。
 
-`python run.py live --duration-seconds 120` 會跑兩分鐘。預設資料庫為 `data/pair_trading.sqlite3`。`python run.py history-status` 查看校準進度；`python run.py report` 查看 paper/shadow 配對成交率與損益。
+`python run.py live --duration-seconds 120` 會跑兩分鐘。預設資料庫為 `data/pair_trading.sqlite3`。`python run.py history-status` 查看校準進度；`python run.py report` 查看 paper/shadow 單腿成交率與損益。
 
 不預載舊回測/舊日期資料。啟動後行情與 order book 只在記憶體中運作；資料庫不逐筆保存它們。策略校準只保存每個已結束市場、每個 bucket 的 spread 與 RV10 中位數，並限制在 rolling window 內。訊號需要各 bucket 至少 50 個 spread 歷史樣本，進場 bucket 至少 100 個 OU 與 RV10 歷史樣本；連續完整蒐集約 100 個 5 分鐘市場（約 8 小時 20 分鐘）後，才可能解除 warm-up。
 
@@ -47,10 +47,10 @@ Discord 損益推送是選用功能：在 Discord 目標伺服器的「伺服器
 
 - Spread = Polymarket UP mid − Binance UP mid；以五個 60 秒 event-time bucket 分組。
 - OU score 使用每個已結束市場、每個 bucket 一筆 spread median，rolling window 最近 100 個市場。Bucket 0 使用一般 z-score；其他 bucket 以這 100 筆估計 AR(1) 平穩均值和標準差，無法估計時退回 z-score。進場 bucket 至少要有 100 筆 OU 歷史。RV10 q90 取同 bucket 最近 100 個已結束市場的 market-median RV10，必須累積滿 100 個才計算。資料庫每個 bucket 各保留最近 100 筆 spread 與 RV10 校準摘要。
-- 僅在 `|OU score| > 3` 且即時 `RV10 > 歷史同 bucket q90` 時進場；OU score 的正負決定方向：負值買 Polymarket UP + Binance DOWN，正值買 Polymarket DOWN + Binance UP。RV10 是最近 10 秒價差相鄰變動平方和開根號，跨 bucket 重設。每個 matched market 最多進場一次。
-- 每腿訂單至少 5 shares。訊號觸發後，兩腿各自固定延遲 330ms 到達；首次 IOC 使用到達當下記憶體中最新、已收到且未過期的 WebSocket book，不等下一筆報價，逐檔消耗可見 ask 深度。部分成交的 IOC 餘額視為取消；兩腿數量不平衡的殘餘曝險會另排延遲回補，後續重試等新的報價。
-- OU score 沿進場方向回到 ±1.5 時觸發出場，最多持有 60 秒；入場時至少需剩 20 秒市場時間。出場訊號觸發後，兩腿分別模擬 330ms 延遲平倉，按到達當下記憶體報價的可見 bid 深度逐檔成交。部分退出會等新的報價再以新訂單延遲重試。進出場都計 taker fee，預設每份 `0.07 * p * (1-p)`。
-- Gamma 與 Binance market metadata 仍由 REST 更新；Polymarket CLOB 與 Binance Predict 的 L2 order book 改由 WebSocket 推送。Order book 留在記憶體中，不逐次寫入 SQLite。訊號成立時保存一筆交易決策；紙上進出場的送單、成交或未成交、每腿數量與 VWAP、費用和損益寫入交易及事件表。程式另記錄 WebSocket 市場訂閱及 run 起訖事件。
+- 僅在 `|OU score| > 3` 且即時 `RV10 > 歷史同 bucket q90` 時進場；OU score 為負時只買 Polymarket UP，為正時只買 Polymarket DOWN。Binance 行情仍參與 spread、OU 與 RV10 計算，但不建立 Binance 部位。RV10 是最近 10 秒價差相鄰變動平方和開根號，跨 bucket 重設。每個 matched market 最多進場一次。
+- 每筆 Polymarket 訂單至少 5 shares。訊號觸發後固定延遲 330ms 到達；首次 IOC 使用到達當下記憶體中最新、已收到且未過期的 Polymarket WebSocket book，不等下一筆報價，逐檔消耗可見 ask 深度。部分成交的 IOC 餘額視為取消，實際成交數量成為持倉。
+- 市場進入最後 60 秒時不開新倉。OU score 沿進場方向回到 ±1.5 時觸發出場，最多持有 60 秒；出場訊號觸發後，模擬 330ms 延遲平倉，按到達當下記憶體報價的可見 bid 深度逐檔成交；部分退出會等新的報價再以新訂單延遲重試。進出場都計 taker fee，預設每份 `0.07 * p * (1-p)`。
+- Gamma 與 Binance market metadata 仍由 REST 更新；Polymarket CLOB 與 Binance Predict 的 L2 order book 改由 WebSocket 推送。Order book 留在記憶體中，不逐次寫入 SQLite。訊號成立時保存一筆交易決策；Polymarket 紙上進出場的送單、成交或未成交、數量與 VWAP、費用和損益寫入交易及事件表。程式另記錄 WebSocket 市場訂閱及 run 起訖事件。
 
 Binance 目前的二元市場 metadata 會提供一個 `marketId` 與 UP/DOWN 兩個 outcome token；orderbook WebSocket payload 只帶 `marketId`，不帶 `tokenId`。程式以該 stream 的 UP 簿作為基準，依二元合約互補關係推導 DOWN 簿：DOWN bids = `1 - UP asks`、DOWN asks = `1 - UP bids`，保留每檔數量。DOWN 因此是從同一份 Binance stream 推導，並非第二份獨立行情簿。
 

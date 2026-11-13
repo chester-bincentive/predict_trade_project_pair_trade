@@ -24,7 +24,7 @@ class Settings:
     bucket_seconds: int = 60
     # Legacy fixed-hold setting retained for the deprecated immediate-fill engine.
     hold_seconds: int = 20
-    min_market_time_left_seconds: int = 20
+    min_market_time_left_seconds: int = 60
     max_hold_seconds: int = 60
     min_shares: float = 5.0
     taker_fee_coefficient: float = 0.07
@@ -56,7 +56,9 @@ class Settings:
             rv_history_window_markets=_int_env("PAIR_RV_HISTORY_WINDOW_MARKETS", 100, minimum=2),
             bucket_seconds=_int_env("PAIR_BUCKET_SECONDS", 60, minimum=1),
             hold_seconds=_int_env("PAIR_HOLD_SECONDS", 20, minimum=1),
-            min_market_time_left_seconds=_int_env("PAIR_MIN_MARKET_TIME_LEFT_SECONDS", 20, minimum=1),
+            min_market_time_left_seconds=max(
+                60, _int_env("PAIR_MIN_MARKET_TIME_LEFT_SECONDS", 60, minimum=1)
+            ),
             max_hold_seconds=_int_env("PAIR_MAX_HOLD_SECONDS", 60, minimum=1),
             min_shares=_float_env("PAIR_MIN_SHARES", 5.0, minimum=1.0),
             taker_fee_coefficient=_float_env("PAIR_TAKER_FEE_COEFFICIENT", 0.07, minimum=0.0),

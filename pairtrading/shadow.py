@@ -65,10 +65,14 @@ class ShadowEngine:
                     return f"OPEN shadow trade {self.active['market_key']}; waiting for its matched market books"
                 self.active["status"] = "UNRESOLVED_AT_END"
                 self.active["closed_at"] = now.isoformat()
+                unresolved_details = {"net_pnl": None}
+                unresolved_details[
+                    "position_shares" if self.active.get("execution_mode") == "polymarket_only"
+                    else "paired_shares"
+                ] = self.active.get("paired_shares", 0)
                 self._event(self.active, "TRADE", None, side=None,
                             status="UNRESOLVED_AT_END",
-                            details={"paired_shares": self.active.get("paired_shares", 0),
-                                     "net_pnl": None})
+                            details=unresolved_details)
                 self._persist()
                 self.active = None
             else:
@@ -90,9 +94,9 @@ class ShadowEngine:
             return "SKIP missing best bid/ask for UP midpoint"
         if elapsed >= 300.0:
             return "SKIP market has ended"
-        if (snapshot.end_at - now).total_seconds() < self.settings.min_market_time_left_seconds:
-            return ("SKIP less than "
-                    f"{self.settings.min_market_time_left_seconds}s remains in matched market")
+        if (snapshot.end_at - now).total_seconds() <= self.settings.min_market_time_left_seconds:
+            return ("SKIP market is in its final "
+                    f"{self.settings.min_market_time_left_seconds}s; no new position")
 
         counts = self.calibration.counts(before_market_start=snapshot.start_at.timestamp())
         missing = [b for b, count in counts.items() if count < self.settings.min_history_markets]
@@ -136,12 +140,13 @@ class ShadowEngine:
             return f"HOLD one-trade-per-market already used OU={ou_score:+.2f}"
 
         if ou_score < 0.0:
-            signal, chosen = "LOW_SPREAD", (("polymarket", "UP"), ("binance", "DOWN"))
+            signal, chosen = "LOW_SPREAD", (("polymarket", "UP"),)
         else:
-            signal, chosen = "HIGH_SPREAD", (("polymarket", "DOWN"), ("binance", "UP"))
+            signal, chosen = "HIGH_SPREAD", (("polymarket", "DOWN"),)
         decision_epoch = now.timestamp()
         scenario_key = (
-            f"feed=websocket-events;retry={self.settings.poll_seconds:g};ou={self.settings.ou_entry_threshold:g};"
+            "mode=polymarket-only;feed=websocket-events;"
+            f"retry={self.settings.poll_seconds:g};ou={self.settings.ou_entry_threshold:g};"
             f"roll={self.settings.history_window_markets};minhist={self.settings.min_history_markets};"
             f"minou={self.settings.min_ou_history_markets};bucket={self.settings.bucket_seconds};"
             f"ouexit={self.settings.ou_exit_threshold:g};maxhold={self.settings.max_hold_seconds};"
@@ -157,7 +162,8 @@ class ShadowEngine:
             "execution=latest-memory-book-at-arrival"
         )
         state: dict[str, Any] = {
-            "run_id": self.run_id, "exit_mode": "directional_ou_threshold",
+            "run_id": self.run_id, "execution_mode": "polymarket_only",
+            "exit_mode": "directional_ou_threshold",
             "market_key": snapshot.market_key, "signal": signal, "zscore": zscore,
             "ou_score": ou_score, "ou_mean": ou_stats.mean, "ou_stdev": ou_stats.stdev,
             "ou_phi": ou_stats.phi, "ou_model": ou_stats.method,
@@ -176,7 +182,8 @@ class ShadowEngine:
         }
         for index, (venue, outcome) in enumerate(chosen):
             state["legs"].append({
-                "name": f"leg{index + 1}", "venue": venue, "outcome": outcome,
+                "name": "position" if len(chosen) == 1 else f"leg{index + 1}",
+                "venue": venue, "outcome": outcome,
                 "entry_filled": 0.0, "entry_cost": 0.0, "entry_fee": 0.0,
                 "entry_attempted": False, "entry_fill_epoch": None,
                 "unwind_remaining": 0.0, "unwind_order": None,
@@ -190,8 +197,8 @@ class ShadowEngine:
         self._persist()
         delay_text = self._delay_summary(state)
         return (f"SHADOW SIGNAL {signal} OU={ou_score:+.2f} z={zscore:+.2f} "
-                f"n={ou_stats.count} model={ou_stats.method}; requested="
-                f"{self.settings.min_shares:g}/leg; RV10={rv10:.6f}>q90={rv_q90:.6f} "
+                f"n={ou_stats.count} model={ou_stats.method}; Polymarket {chosen[0][1]}="
+                f"{self.settings.min_shares:g} shares; RV10={rv10:.6f}>q90={rv_q90:.6f} "
                 f"(n={rv_history_n}); fixed-delay IOC uses memory book at arrival; "
                 f"no orders sent; {delay_text}")
 
@@ -310,8 +317,13 @@ class ShadowEngine:
         if now >= float(state["market_end"]):
             state["status"] = "UNRESOLVED_AT_END"
             state["closed_at"] = snapshot.captured_at.isoformat()
+            unresolved_details = {"net_pnl": None}
+            unresolved_details[
+                "position_shares" if state.get("execution_mode") == "polymarket_only"
+                else "paired_shares"
+            ] = state.get("paired_shares", 0)
             self._event(state, "TRADE", None, side=None, status="UNRESOLVED_AT_END",
-                        details={"paired_shares": state.get("paired_shares", 0), "net_pnl": None})
+                        details=unresolved_details)
             self._persist()
             self.active = None
             return "SHADOW UNRESOLVED: market ended with open/pending exposure; settlement not assumed"
@@ -333,6 +345,8 @@ class ShadowEngine:
         if not state["entries_resolved"] and all(leg["entry_attempted"] for leg in state["legs"]):
             paired = min(float(leg["entry_filled"]) for leg in state["legs"])
             state["paired_shares"] = paired
+            if state.get("execution_mode") == "polymarket_only":
+                state["position_shares"] = paired
             state["entry_cost"] = sum(float(leg["entry_cost"]) for leg in state["legs"])
             state["entry_fee"] = sum(float(leg["entry_fee"]) for leg in state["legs"])
             for leg in state["legs"]:
@@ -354,10 +368,18 @@ class ShadowEngine:
             state["entries_resolved"] = True
             dirty = True
             if paired + 1e-9 < float(state["requested_shares"]):
-                self._event(state, "PAIR", None, side=None,
-                            status="PAIR_PARTIAL" if paired > 0 else "NO_PAIR",
-                            requested=float(state["requested_shares"]), filled=paired,
-                            details={"leg_entry_fills": [leg["entry_filled"] for leg in state["legs"]]})
+                if state.get("execution_mode") == "polymarket_only":
+                    self._event(
+                        state, "POSITION", None, side=None,
+                        status="POSITION_PARTIAL" if paired > 0 else "NO_POSITION",
+                        requested=float(state["requested_shares"]), filled=paired,
+                        details={"venue": "polymarket", "outcome": state["legs"][0]["outcome"]},
+                    )
+                else:
+                    self._event(state, "PAIR", None, side=None,
+                                status="PAIR_PARTIAL" if paired > 0 else "NO_PAIR",
+                                requested=float(state["requested_shares"]), filled=paired,
+                                details={"leg_entry_fills": [leg["entry_filled"] for leg in state["legs"]]})
 
         for leg in state["legs"]:
             remaining = float(leg["unwind_remaining"])
@@ -459,12 +481,17 @@ class ShadowEngine:
             done_unwind = all(float(leg["unwind_remaining"]) <= 1e-9 for leg in state["legs"])
             done_exit = all(float(leg["exit_remaining"]) <= 1e-9 for leg in state["legs"])
             if done_unwind and (done_exit or float(state["paired_shares"]) <= 1e-9):
-                state["status"] = "CLOSED" if float(state["paired_shares"]) > 1e-9 else "NO_PAIR"
+                has_position = float(state["paired_shares"]) > 1e-9
+                state["status"] = (
+                    "CLOSED" if has_position else
+                    "NO_POSITION" if state.get("execution_mode") == "polymarket_only" else "NO_PAIR"
+                )
                 state["net_pnl"] = (float(state["exit_value"]) - float(state["exit_fee"])
                                     - float(state["entry_cost"]) - float(state["entry_fee"]))
                 state["closed_at"] = snapshot.captured_at.isoformat()
                 self._event(state, "TRADE", None, side=None, status=state["status"],
-                            details={"paired_shares": state["paired_shares"],
+                            details={"position_shares" if state.get("execution_mode") == "polymarket_only"
+                                     else "paired_shares": state["paired_shares"],
                                      "entry_cost": state["entry_cost"],
                                      "entry_fee": state["entry_fee"],
                                      "exit_value": state["exit_value"],
@@ -472,6 +499,11 @@ class ShadowEngine:
                                      "net_pnl": state["net_pnl"]})
                 self._persist()
                 self.active = None
+                if state.get("execution_mode") == "polymarket_only":
+                    return (f"SHADOW {state['status']} {state['signal']} "
+                            f"position={state['paired_shares']:g}/{state['requested_shares']:g} "
+                            f"netPnL=${state['net_pnl']:+.4f}; Polymarket only; "
+                            "fills use the latest in-memory book at each order arrival; no orders sent")
                 return (f"SHADOW {state['status']} {state['signal']} paired={state['paired_shares']:g}/"
                         f"{state['requested_shares']:g} netPnL=${state['net_pnl']:+.4f}; "
                         "fills use the latest in-memory book at each order arrival; no orders sent")
@@ -480,28 +512,36 @@ class ShadowEngine:
             self._persist()
         if not state["entries_resolved"]:
             done = sum(bool(leg["entry_attempted"]) for leg in state["legs"])
-            return f"SHADOW ENTRY pending {done}/2 legs; waiting for 330ms order arrival"
+            return (f"SHADOW ENTRY pending {done}/1 Polymarket order; waiting for 330ms order arrival"
+                    if state.get("execution_mode") == "polymarket_only"
+                    else f"SHADOW ENTRY pending {done}/2 legs; waiting for 330ms order arrival")
         if any(float(leg["unwind_remaining"]) > 1e-9 for leg in state["legs"]):
-            return (f"SHADOW SINGLE-LEG EXPOSURE; paired={state['paired_shares']:g}, "
+            quantity_label = "position" if state.get("execution_mode") == "polymarket_only" else "paired"
+            return (f"SHADOW SINGLE-LEG EXPOSURE; {quantity_label}={state['paired_shares']:g}, "
                     f"unwind pending; IOC retry waits for a new book after 330ms arrival")
         if state["paired_shares"] > 1e-9:
+            is_single_leg = state.get("execution_mode") == "polymarket_only"
+            quantity_label = "position" if is_single_leg else "paired"
             if state.get("exit_mode") == "directional_ou_threshold":
                 if state.get("exit_triggered"):
                     return exit_trigger_message or (
-                        f"SHADOW EXIT pending paired={state['paired_shares']:g}; "
+                        f"SHADOW EXIT pending {quantity_label}={state['paired_shares']:g}; "
                         "waiting for 330ms order arrival"
                     )
                 due = state.get("max_hold_due_epoch")
                 left = None if due is None else max(0.0, float(due) - now)
-                return (f"SHADOW OPEN paired={state['paired_shares']:g}; waiting for directional "
+                return (f"SHADOW OPEN {quantity_label}={state['paired_shares']:g}; waiting for directional "
                         f"OU exit at ±{self.settings.ou_exit_threshold:g}; "
                         f"max hold in {left:.1f}s" if left is not None
-                        else f"SHADOW OPEN paired={state['paired_shares']:g}; waiting for OU exit")
+                        else f"SHADOW OPEN {quantity_label}={state['paired_shares']:g}; waiting for OU exit")
             due = state.get("hold_due_epoch")
+            quantity_label = "position" if state.get("execution_mode") == "polymarket_only" else "paired"
             if due is not None and now < float(due):
-                return f"SHADOW OPEN paired={state['paired_shares']:g}; legacy timer {float(due)-now:.1f}s"
-            return f"SHADOW EXIT pending paired={state['paired_shares']:g}; waiting for 330ms order arrival"
-        return "SHADOW NO PAIR; entry filled zero; recording complete"
+                return f"SHADOW OPEN {quantity_label}={state['paired_shares']:g}; legacy timer {float(due)-now:.1f}s"
+            return f"SHADOW EXIT pending {quantity_label}={state['paired_shares']:g}; waiting for 330ms order arrival"
+        return ("SHADOW NO POSITION; Polymarket entry filled zero; recording complete"
+                if state.get("execution_mode") == "polymarket_only"
+                else "SHADOW NO PAIR; entry filled zero; recording complete")
 
     def _persist(self) -> None:
         if self.active is not None:

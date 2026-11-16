@@ -120,6 +120,7 @@ class RollingCalibration:
         self._rv_samples: dict[int, list[float]] = defaultdict(list)
         self._rv = _RV10Accumulator()
         self._ou_cache: dict[tuple[int, float, int], OUStats] = {}
+        self._ou_cache_max_entries = 512
         if not store.rv_history_backfill_disabled():
             self._backfill_rv_history()
         store.prune_calibration_history(spread_window=self.window, rv_window=self.rv_window)
@@ -227,6 +228,8 @@ class RollingCalibration:
                 mean, stationary_sd, phi = fit
                 result = OUStats(count, mean, stationary_sd, phi, "ar1_stationary")
         self._ou_cache[key] = result
+        while len(self._ou_cache) > self._ou_cache_max_entries:
+            self._ou_cache.pop(next(iter(self._ou_cache)))
         return result
 
     def counts(self, *, before_market_start: float) -> dict[int, int]:

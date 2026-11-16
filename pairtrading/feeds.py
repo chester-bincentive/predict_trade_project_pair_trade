@@ -11,6 +11,7 @@ import random
 import re
 import secrets
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlencode
@@ -174,6 +175,22 @@ def _levels(value: Any, *, reverse: bool) -> tuple[Level, ...]:
         except (KeyError, TypeError, ValueError, IndexError):
             continue
     return tuple(sorted(result, key=lambda level: level.price, reverse=reverse))
+
+
+def _levels_for_shares(levels: tuple[Level, ...], shares: float) -> tuple[Level, ...]:
+    """Keep only depth that can affect an IOC no larger than ``shares``."""
+    if shares <= 0.0 or not levels:
+        return levels
+    retained: list[Level] = []
+    total_size = 0.0
+    for level in levels:
+        retained.append(level)
+        total_size += level.size
+        if total_size >= shares:
+            if len(retained) == len(levels):
+                return levels
+            return tuple(retained)
+    return levels
 
 
 def _source_timestamp(payload: Mapping[str, Any], *keys: str) -> datetime | None:
@@ -373,7 +390,7 @@ class PairMarketFeed:
         self._binance_markets: tuple[Market, ...] = ()
         self._closed = False
         self._books: dict[tuple[str, str], Book] = {}
-        self._book_history: dict[tuple[str, str], list[Book]] = {}
+        self._book_history: dict[tuple[str, str], deque[Book]] = {}
         self._poly_state: dict[str, dict[str, Any]] = {}
         self._binance_update_ms: dict[str, int] = {}
         self._binance_id_outcomes: dict[str, str] = {}
@@ -528,22 +545,36 @@ class PairMarketFeed:
                 ("binance", "UP"), ("binance", "DOWN"))
         books: dict[tuple[str, str], Book] = {}
         for key in keys:
-            eligible = [book for book in self._book_history.get(key, ())
-                        if book.received_at.timestamp() <= at_epoch + 1e-9]
-            if not eligible:
+            history = self._book_history.get(key)
+            if not history:
                 return None
-            books[key] = eligible[-1]
+            for book in reversed(history):
+                if book.received_at.timestamp() <= at_epoch + 1e-9:
+                    books[key] = book
+                    break
+            else:
+                return None
         return PairSnapshot(
             poly_market.key, poly_market, binance_market, books,
             datetime.fromtimestamp(at_epoch, tz=timezone.utc), skew,
         )
 
     def _remember_book(self, key: tuple[str, str], book: Book) -> None:
-        history = self._book_history.setdefault(key, [])
-        history.append(book)
+        history = self._book_history.setdefault(key, deque())
+        shares = float(self.settings.min_shares)
+        bids = _levels_for_shares(book.bids, shares)
+        asks = _levels_for_shares(book.asks, shares)
+        if bids is book.bids and asks is book.asks:
+            history.append(book)
+        else:
+            history.append(Book(
+                book.venue, book.outcome, book.token_id, bids, asks,
+                book.received_at, book.source_at,
+                book.request_started_at, book.request_rtt_ms,
+            ))
         cutoff = book.received_at.timestamp() - BOOK_HISTORY_SECONDS
         while len(history) > 1 and history[0].received_at.timestamp() < cutoff:
-            history.pop(0)
+            history.popleft()
 
     def _clear_venue_books(self, venue: str) -> None:
         for key in tuple(self._books):

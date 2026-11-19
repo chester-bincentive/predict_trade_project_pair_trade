@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import csv
 from collections import defaultdict
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +74,7 @@ def _line(snapshot, message: str) -> str:
 
 LIVE_STATUS_LOG_INTERVAL_SECONDS = 60.0
 LIVE_STATUS_CHANGE_LOG_INTERVAL_SECONDS = 5.0
+_FEED_ERROR_URL_QUERY_RE = re.compile(r"""(https?://[^\s?'\"<>]+)\?[^\s'\"<>]*""", re.IGNORECASE)
 
 
 def _status_log_key(message: str) -> str:
@@ -156,9 +158,10 @@ class _FeedErrorLogger:
 
     def report(self, exc: Exception) -> None:
         now = time.monotonic()
-        key = f"{type(exc).__name__}: {exc}"
+        safe_message = _FEED_ERROR_URL_QUERY_RE.sub(r"\1?[query redacted]", str(exc))
+        key = f"{type(exc).__name__}: {safe_message}"
         if key != self.last_key or now - self.last_logged_at >= LIVE_STATUS_LOG_INTERVAL_SECONDS:
-            print(f"FEED ERROR ({type(exc).__name__}): {exc}; retrying", flush=True)
+            print(f"FEED ERROR ({type(exc).__name__}): {safe_message}; retrying", flush=True)
             self.last_key = key
             self.last_logged_at = now
 

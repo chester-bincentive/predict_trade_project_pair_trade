@@ -2,7 +2,7 @@
 
 這是獨立資料夾中的初版系統：讀取 Polymarket 與 Binance Wallet Predict 同一個 BTC 5 分鐘區間的行情，計算 walk-forward spread 與 OU score，再以 shadow execution 模擬只在 Polymarket 建立單腿部位。Binance 行情仍用於訊號計算，不送出或模擬 Binance 訂單。
 
-預設 `live` 指令以即時行情執行 paper/shadow mode：order book 只在記憶體中供策略與成交模擬使用；資料庫保存訊號決策、紙上訂單嘗試與成交、費用與損益，以及市場訂閱和程式啟停事件。只有明確指定 `--execution-mode live` 或設定 `PAIR_TRADING_MODE=live` 才會送出真實訂單。為了跨重啟維持策略校準，另保留每個 bucket 最近 200 筆 spread 中位數與 100 筆 RV10 中位數；不保存逐筆行情或完整深度。
+未設定模式時，`live` 指令以即時行情執行 paper/shadow mode：order book 只在記憶體中供策略與成交模擬使用；資料庫保存訊號決策、紙上訂單嘗試與成交、費用與損益，以及市場訂閱和程式啟停事件。只有明確指定 `--execution-mode live` 或設定 `PAIR_TRADING_MODE=live` 才會送出真實訂單。`.env.example` 是 live 範本；複製成 `.env` 並填妥有效憑證後，會啟用真實下單。為了跨重啟維持策略校準，另保留每個 bucket 最近 200 筆 spread 中位數與 100 筆 RV10 中位數；不保存逐筆行情或完整深度。
 `demo` 與公開的 `PaperEngine` 也使用相同的延遲到達成交邏輯。
 
 ## 執行
@@ -23,16 +23,18 @@ python --version
 
 也可略過啟用步驟，直接執行 `.\.venv\Scripts\python.exe run.py demo`。
 
-`demo` 用合成行情與合成歷史值，走一次既有訊號/紙上成交流程；不連網、不污染 live 資料庫。即時 shadow 掃描先複製範例環境檔：
+`demo` 用合成行情與合成歷史值，走一次既有訊號/紙上成交流程；不連網、不污染 live 資料庫。複製範例環境檔：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-編輯 `.env`，填入 Binance Wallet Predict 市場資料 API 所需的 `BINANCE_API_KEY`、`BINANCE_API_SECRET`，再執行：
+`.env.example` 預設為 `PAIR_TRADING_MODE=live`。若要執行 paper/shadow，先將它改為 `PAIR_TRADING_MODE=paper`。Live 模式還需要填妥下方列出的 Polymarket 憑證；不要把 `.env` 提交到 repo。
+
+編輯 `.env`，填入 Binance Wallet Predict 市場資料 API 所需的 `BINANCE_API_KEY`、`BINANCE_API_SECRET`，再依「實際下單模式」一節設定 Polymarket 憑證。明確以 live 模式啟動：
 
 ```powershell
-.venv\Scripts\python.exe run.py live
+.venv\Scripts\python.exe run.py live --execution-mode live
 ```
 
 Discord 損益推送是選用功能：在 Discord 目標伺服器的「伺服器設定 → 整合 → Webhooks」建立 incoming webhook，選擇要接收訊息的頻道，再複製 webhook URL 到 `.env` 的 `PAIR_DISCORD_WEBHOOK_URL`。程式啟動後會立即推送摘要，再依 `PAIR_DISCORD_PNL_INTERVAL_SECONDS` 定期推送；預設每 900 秒（15 分鐘），最短可設 60 秒。摘要包含本次啟動後新增的已實現損益、資料庫累計損益、完成筆數、勝率、未平倉和未解決筆數。Webhook 欄位留白就不推送。Webhook URL 等同密碼，請勿分享或提交 `.env`；`.gitignore` 已排除 `.env`。
@@ -45,7 +47,7 @@ Discord 損益推送是選用功能：在 Discord 目標伺服器的「伺服器
 
 ## 實際下單模式
 
-預設仍為 paper/shadow，不會送出真實訂單。需明確設定 `PAIR_TRADING_MODE=live`，或啟動時加上 `--execution-mode live`，才會啟用 Polymarket 真實 FAK 委託。Live 使用 `polymarket-client==0.18.0`，私鑰優先由 `CREDSTORE_REGION` 與 `CREDSTORE_SECRET_NAME` 指定的 credstore 讀取；取不到時才使用 `POLYMARKET_PRIVATE_KEY`。另外需提供 `POLYMARKET_RELAYER_API_KEY` 與 `POLYMARKET_RELAYER_API_KEY_ADDRESS`。EOA 可不填 wallet address；proxy/smart-wallet 要填 `POLYMARKET_WALLET_ADDRESS`。
+未設定模式時，程式仍以 paper/shadow 執行；`.env.example` 已設為 `PAIR_TRADING_MODE=live`，因此複製後會選擇真實下單模式。Live 使用 `polymarket-client==0.18.0`，私鑰由 `CREDSTORE_REGION` 與 `CREDSTORE_SECRET_NAME` 指定的 credstore 讀取，或直接填 `POLYMARKET_PRIVATE_KEY`。另外必須提供 `POLYMARKET_RELAYER_API_KEY` 與 `POLYMARKET_RELAYER_API_KEY_ADDRESS`。EOA 可不填 wallet address；proxy/smart-wallet 要填 `POLYMARKET_WALLET_ADDRESS`。範例中的憑證欄位保持空白，需自行填入有效值；沒有有效憑證時不能送單。要跑 paper/shadow，請把 `PAIR_TRADING_MODE` 改為 `paper`。
 
 Live 會先驗證 Gamma condition ID 與登入後 CLOB 的 UP/DOWN token 是否一致，並在進入訊號區前預熱 SDK 訂單 metadata、預簽可用的 BUY 限價單。買入使用 exact-share 限價 FAK，數量是策略要求的 shares；限價為送單當下最新記憶體 best ask 加 `PAIR_LIVE_MAX_SLIPPAGE`（預設 $0.15），按 tick size 對齊且最高 $0.99。沒有每筆 USDC 預算上限。明確 FAK 未撮合時，程式讀取最新記憶體簿重新計價並最多重試一次；逾時、取消或回覆不完整則標為未知，不會自動重送。
 

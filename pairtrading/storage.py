@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import math
 from pathlib import Path
 from typing import Any
 
 
 class Store:
     def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(
@@ -124,6 +126,10 @@ class Store:
                 market_key TEXT, venue TEXT, details_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS runtime_events_run_time ON runtime_events(run_id, id);
+            CREATE TABLE IF NOT EXISTS market_resolutions (
+                market_key TEXT PRIMARY KEY, condition_id TEXT, winning_asset_id TEXT NOT NULL,
+                resolved_at TEXT NOT NULL
+            );
             """
         )
         trade_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(shadow_trades)")}
@@ -139,6 +145,38 @@ class Store:
 
     def close(self) -> None:
         self.db.close()
+
+    def copy_calibration_from(self, source_path: Path, *,
+                              spread_window: int, rv_window: int) -> tuple[int, int]:
+        """Copy only completed-market calibration summaries into a live ledger."""
+        source_path = Path(source_path)
+        if not source_path.exists() or source_path.resolve() == self.path.resolve():
+            return 0, 0
+        uri = source_path.resolve().as_uri() + "?mode=ro"
+        source = sqlite3.connect(uri, uri=True)
+        source.row_factory = sqlite3.Row
+        try:
+            spread_rows = source.execute(
+                "SELECT market_key,market_end,bucket,median_spread,sample_count FROM bucket_history"
+            ).fetchall()
+            rv_rows = source.execute(
+                "SELECT market_key,market_end,bucket,median_rv10,sample_count FROM bucket_rv_history"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return 0, 0
+        finally:
+            source.close()
+        with self.db:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO bucket_history VALUES (?,?,?,?,?)",
+                [tuple(row) for row in spread_rows],
+            )
+            self.db.executemany(
+                "INSERT OR IGNORE INTO bucket_rv_history VALUES (?,?,?,?,?)",
+                [tuple(row) for row in rv_rows],
+            )
+        self.prune_calibration_history(spread_window=spread_window, rv_window=rv_window)
+        return len(spread_rows), len(rv_rows)
 
     def record_quote(self, row: dict[str, Any]) -> None:
         self.db.execute(
@@ -262,9 +300,89 @@ class Store:
 
     def open_shadow_trades(self) -> list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT payload_json FROM shadow_trades WHERE status='OPEN' ORDER BY id"
+            "SELECT payload_json FROM shadow_trades "
+            "WHERE status IN ('OPEN','UNRESOLVED_LIVE_ORDER','UNRESOLVED_LIVE_POSITION') ORDER BY id"
         ).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
+
+    def settlement_pending_trades(self) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT payload_json FROM shadow_trades WHERE status='SETTLEMENT_PENDING' ORDER BY id"
+        ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def shadow_trade_for_market(self, market_key: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT payload_json FROM shadow_trades WHERE market_key=? ORDER BY id DESC LIMIT 1",
+            (market_key,),
+        ).fetchone()
+        return None if row is None else json.loads(row["payload_json"])
+
+    def record_market_resolution(self, *, market_key: str, condition_id: str | None,
+                                 winning_asset_id: str, resolved_at: str) -> None:
+        with self.db:
+            self.db.execute(
+                """INSERT INTO market_resolutions(market_key,condition_id,winning_asset_id,resolved_at)
+                   VALUES(?,?,?,?) ON CONFLICT(market_key) DO UPDATE SET
+                   condition_id=excluded.condition_id, winning_asset_id=excluded.winning_asset_id,
+                   resolved_at=excluded.resolved_at""",
+                (market_key, condition_id, winning_asset_id, resolved_at),
+            )
+
+    def market_resolution(self, market_key: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT market_key,condition_id,winning_asset_id,resolved_at "
+            "FROM market_resolutions WHERE market_key=?",
+            (market_key,),
+        ).fetchone()
+
+    def live_order_latency_summary(self, run_id: str | None = None) -> dict[str, Any]:
+        metrics: dict[str, list[float]] = {}
+        if run_id is None:
+            rows = self.db.execute(
+                "SELECT details_json FROM shadow_events WHERE venue='polymarket' ORDER BY id DESC LIMIT 1000"
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                """SELECT e.details_json FROM shadow_events e
+                   JOIN shadow_trades t ON t.id=e.trade_id
+                   WHERE e.venue='polymarket' AND t.run_id=? ORDER BY e.id""",
+                (run_id,),
+            ).fetchall()
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"])
+                timing = details.get("live_order_timing") if isinstance(details, dict) else None
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(timing, dict):
+                continue
+            for name in (
+                "trigger_to_post_start_ms", "intent_to_post_start_ms", "order_create_ms",
+                "sdk_post_order_call_ms", "post_http_total_ms",
+            ):
+                value = timing.get(name)
+                try:
+                    number = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(number) and number >= 0:
+                    metrics.setdefault(name, []).append(number)
+
+        def percentile(values: list[float], quantile: float) -> float | None:
+            if not values:
+                return None
+            values.sort()
+            return values[min(len(values) - 1, max(0, math.ceil(quantile * len(values)) - 1))]
+
+        return {
+            "orders": len(metrics.get("trigger_to_post_start_ms", [])),
+            "metrics": {
+                name: {"n": len(values), "p50": percentile(values, 0.50),
+                       "p90": percentile(values, 0.90), "p99": percentile(values, 0.99)}
+                for name, values in metrics.items()
+            },
+        }
 
     def has_shadow_trade(self, market_key: str) -> bool:
         return self.db.execute(

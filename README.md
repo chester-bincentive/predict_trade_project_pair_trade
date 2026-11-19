@@ -2,7 +2,7 @@
 
 這是獨立資料夾中的初版系統：讀取 Polymarket 與 Binance Wallet Predict 同一個 BTC 5 分鐘區間的行情，計算 walk-forward spread 與 OU score，再以 shadow execution 模擬只在 Polymarket 建立單腿部位。Binance 行情仍用於訊號計算，不送出或模擬 Binance 訂單。
 
-`live` 是即時行情 paper/shadow mode：order book 只在記憶體中供策略與 Polymarket 成交模擬使用；資料庫保存訊號決策、紙上訂單嘗試與成交、費用與損益，以及市場訂閱和程式啟停事件。為了跨重啟維持策略校準，另保留每個 bucket 最近 200 筆 spread 中位數與 100 筆 RV10 中位數；不保存逐筆行情或完整深度。不會建立或送出任何真實訂單。
+預設 `live` 指令以即時行情執行 paper/shadow mode：order book 只在記憶體中供策略與成交模擬使用；資料庫保存訊號決策、紙上訂單嘗試與成交、費用與損益，以及市場訂閱和程式啟停事件。只有明確指定 `--execution-mode live` 或設定 `PAIR_TRADING_MODE=live` 才會送出真實訂單。為了跨重啟維持策略校準，另保留每個 bucket 最近 200 筆 spread 中位數與 100 筆 RV10 中位數；不保存逐筆行情或完整深度。
 `demo` 與公開的 `PaperEngine` 也使用相同的延遲到達成交邏輯。
 
 ## 執行
@@ -43,6 +43,18 @@ Discord 損益推送是選用功能：在 Discord 目標伺服器的「伺服器
 
 `python run.py clear-history` 只清除 bucket calibration rows 和舊的 `data/market_history.csv`；舊版本留下的 quote ticks 與完整深度資料會保留，但新版 live 不再新增這些資料。手動匯入 spread 校準資料可用 `import-history --history-csv FILE`，CSV 欄位需為 `market_key,market_end_time,bucket,median_spread`，可加 `sample_count`；RV10 q90 的 100 個市場樣本仍需由 live 行情蒐集。
 
+## 實際下單模式
+
+預設仍為 paper/shadow，不會送出真實訂單。需明確設定 `PAIR_TRADING_MODE=live`，或啟動時加上 `--execution-mode live`，才會啟用 Polymarket 真實 FAK 委託。Live 使用 `polymarket-client==0.18.0`，私鑰優先由 `CREDSTORE_REGION` 與 `CREDSTORE_SECRET_NAME` 指定的 credstore 讀取；取不到時才使用 `POLYMARKET_PRIVATE_KEY`。另外需提供 `POLYMARKET_RELAYER_API_KEY` 與 `POLYMARKET_RELAYER_API_KEY_ADDRESS`。EOA 可不填 wallet address；proxy/smart-wallet 要填 `POLYMARKET_WALLET_ADDRESS`。
+
+Live 會先驗證 Gamma condition ID 與登入後 CLOB 的 UP/DOWN token 是否一致，並在進入訊號區前預熱 SDK 訂單 metadata、預簽可用的 BUY 限價單。買入使用 exact-share 限價 FAK，數量是策略要求的 shares；限價為送單當下最新記憶體 best ask 加 `PAIR_LIVE_MAX_SLIPPAGE`（預設 $0.15），按 tick size 對齊且最高 $0.99。沒有每筆 USDC 預算上限。明確 FAK 未撮合時，程式讀取最新記憶體簿重新計價並最多重試一次；逾時、取消或回覆不完整則標為未知，不會自動重送。
+
+賣出使用 exact-share FAK，限價設為 $0.01，讓可成交的剩餘持倉盡量立即賣出；FAK 明確未成交或部分成交時，立即用最新記憶體簿重送剩餘股數，不等冷卻時間或下一筆 WebSocket 更新。若目前沒有可用 bid、報價過期或市場驗證失敗，則等可用簿更新後再送。委託前會檢查簿的更新年齡（`PAIR_LIVE_MAX_BOOK_AGE_SECONDS`，預設 2 秒）與市場最後 60 秒限制。每次 intent 會先寫入資料庫，再呼叫 CLOB；簽名、SDK POST、HTTP 回應和回報耗時也會寫入交易事件。
+
+到期仍持有的部位改記為 `SETTLEMENT_PENDING`，釋放策略槽位繼續下一個市場。獨立 WebSocket 監聽 Polymarket `market_resolved` 勝方，將未平倉 shares 按 $1 或 $0 派彩納入淨損益；重啟時會替資料庫中仍待結算的市場恢復監聽，最長監聽到到期後 `PAIR_RESOLUTION_GRACE_SECONDS`（預設 900 秒）。此流程只更新本機交易帳本，不會替錢包執行鏈上 redeem。若 API 訂單結果不明，仍會停止新交易並要求對帳，以避免重複下單。
+
+Live 帳本預設獨立存於 `data/live_pair_trading.sqlite3`，啟動時只從 paper DB 複製已完成市場的 spread/RV10 校準摘要，不複製 paper 交易。若要下單，請先確認帳戶、token、資金及環境變數，再使用 `python run.py live --execution-mode live`；不要用 `demo` 模式下單。程式不會在本次修改中啟動或送出任何訂單。
+
 ## 策略與模擬成交
 
 - Spread = Polymarket UP mid − Binance UP mid；以五個 60 秒 event-time bucket 分組。
@@ -60,7 +72,7 @@ Order book 透過 WebSocket 接收：Polymarket 先用完整簿初始化，再�
 
 由於完全不送訂單，真實「送單網路延遲」與「交易 API 接收/ACK 延遲」無從量測。預設每腿從模擬送單到抵達固定 330ms、jitter=0；這是情境假設，不是平台實測值。可用 `.env` 調整延遲參數。
 
-Shadow 比「訊號當下立即按 mid/top-of-book 成交」更嚴格，但仍不等同實盤：WebSocket 斷線期間不會有可用行情，重連後需等新簿初始化；可見深度仍可能在訂單抵達前撤掉；目前假設 taker IOC 立即吃可見深度、不排隊，也沒有真實 ACK/拒單、rate limit、實際費率級距或結算自動化。市場結束時仍未平倉的交易標記 `UNRESOLVED_AT_END`，不猜結算損益。跨平台相同時間區間也不代表結算規則相同，shadow PnL 不是實盤獲利證明。
+Shadow 比「訊號當下立即按 mid/top-of-book 成交」更嚴格，但仍不等同實盤：WebSocket 斷線期間不會有可用行情，重連後需等新簿初始化；可見深度仍可能在訂單抵達前撤掉；模擬會立即吃可見深度、不排隊，並不包含真實 ACK/拒單、rate limit 或帳戶實際費率級距。Live 雖採用真實 FAK 回報與官方市場結算結果，仍可能因市場解析事件延遲、錢包餘額/授權、鏈上 redeem 與資料源中斷而需要人工核對；本機帳本結算不代表鏈上贖回已完成。跨平台相同時間區間也不代表結算規則相同，shadow PnL 不是實盤獲利證明。
 
 ## 參考來源
 

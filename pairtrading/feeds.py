@@ -13,7 +13,7 @@ import secrets
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlencode
 
 import httpx
@@ -94,7 +94,20 @@ def _parse_poly_market(row: Mapping[str, Any]) -> Market:
     if abs((end - start).total_seconds() - 300.0) > 2.0:
         end = start + timedelta(seconds=300)
     up, down, _, _ = _market_outcomes(row)
-    return Market("polymarket", slug, slug, start, end, up, down)
+    condition_id = _value(row, "conditionId", "condition_id")
+    try:
+        min_order_size = float(_value(
+            row, "minimumOrderSize", "minOrderSize", "minimum_order_size", default=5.0
+        ))
+    except (TypeError, ValueError):
+        min_order_size = 5.0
+    if min_order_size <= 0:
+        min_order_size = 5.0
+    return Market(
+        "polymarket", slug, slug, start, end, up, down,
+        condition_id=None if condition_id is None else str(condition_id),
+        min_order_size=min_order_size,
+    )
 
 
 def _parse_binance_market(topic: Mapping[str, Any]) -> Market:
@@ -376,11 +389,15 @@ class PairMarketFeed:
     """Refresh market metadata over REST and stream paired L2 books over WebSockets."""
 
     def __init__(self, settings: Any, *,
-                 subscription_recorder: Callable[[str, str, dict[str, Any]], None] | None = None) -> None:
+                 subscription_recorder: Callable[[str, str, dict[str, Any]], None] | None = None,
+                 market_ready_callback: Callable[[Market], Awaitable[Any]] | None = None,
+                 resolution_callback: Callable[[Market, str, datetime], Awaitable[Any]] | None = None) -> None:
         timeout = httpx.Timeout(8.0, connect=5.0)
         self.client = httpx.AsyncClient(timeout=timeout)
         self.settings = settings
         self.subscription_recorder = subscription_recorder
+        self.market_ready_callback = market_ready_callback
+        self.resolution_callback = resolution_callback
         self.poly = PolymarketFeed(self.client)
         self.binance = BinancePredictFeed(
             self.client, os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_API_SECRET", "")
@@ -399,6 +416,9 @@ class PairMarketFeed:
         self._stream_key: tuple[str, ...] | None = None
         self._stream_tasks: tuple[asyncio.Task[None], ...] = ()
         self._active_pair: tuple[Market, Market, float] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._market_ready_keys: set[str] = set()
+        self._resolution_watchers: dict[str, asyncio.Task[None]] = {}
 
     def _record_subscription(self, venue: str, market: Market,
                              details: dict[str, Any]) -> None:
@@ -412,12 +432,22 @@ class PairMarketFeed:
 
     async def close(self) -> None:
         self._closed = True
-        for task in self._stream_tasks:
+        tasks = (*self._stream_tasks, *tuple(self._background_tasks), *tuple(self._resolution_watchers.values()))
+        for task in tasks:
             task.cancel()
-        if self._stream_tasks:
-            await asyncio.gather(*self._stream_tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._stream_tasks = ()
+        self._background_tasks.clear()
+        self._resolution_watchers.clear()
         await self.client.aclose()
+
+    def current_book(self, venue: str, outcome: str) -> Book | None:
+        """Return the latest mutable in-memory L2 view for live execution."""
+        return self._books.get((venue, outcome))
+
+    def watch_market_resolution(self, market: Market) -> None:
+        self._start_resolution_watcher(market)
 
     async def capture(self, timeout_seconds: float | None = None) -> PairSnapshot | None:
         deadline = None if timeout_seconds is None else time.monotonic() + max(0.0, timeout_seconds)
@@ -486,6 +516,7 @@ class PairMarketFeed:
         return poly, binance, skew
 
     async def _ensure_streams(self, poly_market: Market, binance_market: Market, skew: float) -> None:
+        self._start_market_background_tasks(poly_market)
         key = (
             poly_market.up_token, poly_market.down_token,
             binance_market.up_token, binance_market.down_token,
@@ -523,6 +554,112 @@ class PairMarketFeed:
             asyncio.create_task(self._run_polymarket(poly_market), name="polymarket-orderbook-ws"),
             asyncio.create_task(self._run_binance(binance_market), name="binance-predict-orderbook-ws"),
         )
+
+    def _market_watch_key(self, market: Market) -> str:
+        return str(market.condition_id or market.key).lower()
+
+    def _start_market_background_tasks(self, market: Market) -> None:
+        watch_key = self._market_watch_key(market)
+        if self.market_ready_callback is not None and watch_key not in self._market_ready_keys:
+            self._market_ready_keys.add(watch_key)
+            task = asyncio.create_task(
+                self.market_ready_callback(market), name=f"polymarket-prepare-{market.key}"
+            )
+            self._background_tasks.add(task)
+
+            def on_prepare_done(done: asyncio.Task[Any], key: str = watch_key) -> None:
+                self._background_tasks.discard(done)
+                if done.cancelled():
+                    self._market_ready_keys.discard(key)
+                    return
+                error = done.exception()
+                if error is not None:
+                    self._market_ready_keys.discard(key)
+                    _LOGGER.warning("Polymarket live-market preparation failed (%s)", type(error).__name__)
+
+            task.add_done_callback(on_prepare_done)
+        self._start_resolution_watcher(market)
+
+    def _start_resolution_watcher(self, market: Market) -> None:
+        if self.resolution_callback is None or not market.up_token or not market.down_token:
+            return
+        key = self._market_watch_key(market)
+        task = self._resolution_watchers.get(key)
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(
+            self._run_resolution_watcher(market), name=f"polymarket-resolution-{market.key}"
+        )
+        self._resolution_watchers[key] = task
+
+        def on_resolution_done(done: asyncio.Task[None], watch_key: str = key) -> None:
+            if self._resolution_watchers.get(watch_key) is done:
+                self._resolution_watchers.pop(watch_key, None)
+            if not done.cancelled() and done.exception() is not None:
+                _LOGGER.warning("Polymarket resolution watcher stopped (%s)",
+                                type(done.exception()).__name__)
+
+        task.add_done_callback(on_resolution_done)
+
+    async def _run_resolution_watcher(self, market: Market) -> None:
+        grace_seconds = float(getattr(self.settings, "resolution_grace_seconds", 900.0))
+        grace_seconds = max(0.0, grace_seconds)
+        deadline = max(market.end_at.timestamp() + grace_seconds, time.time() + grace_seconds)
+        delay = 1.0
+        while not self._closed and time.time() <= deadline:
+            connected_at = time.monotonic()
+            heartbeat: asyncio.Task[None] | None = None
+            try:
+                async with websockets.connect(
+                    POLYMARKET_WS_URL, ping_interval=None, open_timeout=10, close_timeout=3,
+                    max_queue=4096,
+                ) as ws:
+                    await ws.send(json.dumps({
+                        "type": "market", "assets_ids": [market.up_token, market.down_token],
+                        "custom_feature_enabled": True,
+                    }))
+                    heartbeat = asyncio.create_task(self._polymarket_heartbeat(ws))
+                    delay = 1.0
+                    async for raw in ws:
+                        if isinstance(raw, str) and raw.upper() in {"PING", "PONG"}:
+                            if raw.upper() == "PING":
+                                await ws.send("PONG")
+                            continue
+                        try:
+                            decoded = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        messages = decoded if isinstance(decoded, list) else [decoded]
+                        for message in messages:
+                            if not isinstance(message, Mapping):
+                                continue
+                            event_type = str(_value(message, "event_type", "eventType", default="")).lower()
+                            if event_type != "market_resolved":
+                                continue
+                            payload = message.get("payload") if isinstance(message.get("payload"), Mapping) else message
+                            winner = str(_value(payload, "winning_asset_id", "winningAssetId", default=""))
+                            if winner not in {market.up_token, market.down_token}:
+                                continue
+                            assert self.resolution_callback is not None
+                            await self.resolution_callback(market, winner, utc_now())
+                            return
+                    if time.time() > deadline:
+                        return
+                    raise ConnectionError("Polymarket resolution WebSocket closed")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _LOGGER.warning("Polymarket resolution watcher disconnected (%s); reconnecting in %.1fs",
+                                type(exc).__name__, delay)
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(min(remaining, delay + random.uniform(0.0, min(1.0, delay * 0.25))))
+                delay = 1.0 if time.monotonic() - connected_at >= 30.0 else min(delay * 2.0, 30.0)
+            finally:
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
 
     def _snapshot_if_ready(self) -> PairSnapshot | None:
         if self._active_pair is None:

@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from .config import Settings
 from .discord_pnl import DiscordPnLNotifier
 from .feeds import FeedError, PairMarketFeed
+from .live_execution import PolymarketLiveExecutor
+from .models import Market
 from .paper import demo
 from .shadow import ShadowEngine
 from .storage import Store
@@ -27,6 +29,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("mode", choices=("demo", "live", "import-history", "history-status", "clear-history", "report"), nargs="?", default="demo")
     parser.add_argument("--history-csv", type=Path, help="normalized closed-market bucket medians CSV")
     parser.add_argument("--duration-seconds", type=float, default=0.0, help="stop live shadow scan after N seconds; 0 runs until Ctrl+C")
+    parser.add_argument("--execution-mode", choices=("paper", "live"), default=None,
+                        help="execution mode for the live command; defaults to PAIR_TRADING_MODE")
     return parser.parse_args()
 
 
@@ -78,9 +82,19 @@ def _status_log_key(message: str) -> str:
         return "DATA COLLECTION ONLY; insufficient closed-market history"
     if message.startswith("DATA COLLECTION ONLY; bucket="):
         return message.split(" has ", 1)[0]
-    if message.startswith("SHADOW ENTRY pending"):
+    if message.startswith(("SHADOW ENTRY pending", "LIVE ENTRY pending")):
         return message.split(";", 1)[0]
     for prefix in (
+        "LIVE OPEN",
+        "LIVE SINGLE-LEG EXPOSURE",
+        "LIVE NO POSITION",
+        "LIVE EXIT pending",
+        "LIVE EXIT TRIGGER",
+        "LIVE ENTRY",
+        "LIVE CLOSED",
+        "LIVE ORDER RESULT UNKNOWN",
+        "LIVE POSITION UNRESOLVED",
+        "LIVE UNRESOLVED",
         "SHADOW OPEN",
         "SHADOW SINGLE-LEG EXPOSURE",
         "SHADOW NO POSITION",
@@ -106,6 +120,16 @@ class _LiveStatusLogger:
         changed = key != self.last_key
         heartbeat_due = now - self.last_logged_at >= LIVE_STATUS_LOG_INTERVAL_SECONDS
         important_change = changed and key.startswith((
+            "LIVE ENTRY",
+            "LIVE SINGLE-LEG",
+            "LIVE OPEN",
+            "LIVE EXIT",
+            "LIVE CLOSED",
+            "LIVE NO PAIR",
+            "LIVE NO POSITION",
+            "LIVE ORDER RESULT UNKNOWN",
+            "LIVE POSITION UNRESOLVED",
+            "LIVE UNRESOLVED",
             "SHADOW ENTRY",
             "SHADOW SINGLE-LEG",
             "SHADOW OPEN",
@@ -145,14 +169,24 @@ class _FeedErrorLogger:
             self.last_logged_at = 0.0
 
 
-async def _live(settings: Settings, duration: float) -> None:
-    store = Store(settings.db_path)
+async def _live(settings: Settings, duration: float, execution_mode: str = "paper") -> None:
+    if execution_mode not in {"paper", "live"}:
+        raise ValueError("execution mode must be paper or live")
+    db_path = settings.live_db_path if execution_mode == "live" else settings.db_path
+    store = Store(db_path)
+    if execution_mode == "live":
+        copied_spread, copied_rv = store.copy_calibration_from(
+            settings.db_path,
+            spread_window=settings.history_window_markets,
+            rv_window=settings.rv_history_window_markets,
+        )
+        print(f"Copied calibration summaries to live ledger: spread={copied_spread}, RV10={copied_rv}.")
     run_id = uuid.uuid4().hex
     start = time.monotonic()
     store.record_runtime_event(
         run_id=run_id, event_type="run_started",
         details={
-            "mode": "live_shadow",
+            "mode": "live_real_orders" if execution_mode == "live" else "live_shadow",
             "ou_entry_threshold": settings.ou_entry_threshold,
             "ou_exit_threshold": settings.ou_exit_threshold,
             "min_ou_history_markets": settings.min_ou_history_markets,
@@ -163,13 +197,17 @@ async def _live(settings: Settings, duration: float) -> None:
             "min_market_time_left_seconds": settings.min_market_time_left_seconds,
             "max_hold_seconds": settings.max_hold_seconds,
             "execution_mode": "polymarket_only",
+            "trading_mode": execution_mode,
             "shares_per_order": settings.min_shares,
             "fee_coefficient": settings.taker_fee_coefficient,
             "max_quote_age_seconds": settings.max_quote_age_seconds,
-            "order_delay_ms": {
-                "polymarket": settings.poly_order_network_ms + settings.poly_order_api_ms,
-                "binance": settings.binance_order_network_ms + settings.binance_order_api_ms,
-            },
+            "order_delay_ms": {"polymarket": 0 if execution_mode == "live" else
+                                settings.poly_order_network_ms + settings.poly_order_api_ms},
+            "live_max_slippage": settings.live_max_slippage if execution_mode == "live" else None,
+            "live_max_book_age_seconds": settings.live_max_book_age_seconds if execution_mode == "live" else None,
+            "live_retry_interval_seconds": settings.live_retry_interval_seconds if execution_mode == "live" else None,
+            "resolution_grace_seconds": settings.resolution_grace_seconds if execution_mode == "live" else None,
+
         },
     )
 
@@ -179,14 +217,65 @@ async def _live(settings: Settings, duration: float) -> None:
             market_key=market_key, venue=venue, details=details,
         )
 
-    engine = ShadowEngine(store, settings, run_id=run_id)
-    feed = PairMarketFeed(settings, subscription_recorder=record_subscription)
+    live_executor = PolymarketLiveExecutor(settings.taker_fee_coefficient) if execution_mode == "live" else None
+    engine = ShadowEngine(store, settings, run_id=run_id, live_executor=live_executor)
+
+    async def prepare_live_market(market: Market) -> None:
+        if live_executor is None:
+            return
+        started = time.perf_counter()
+        try:
+            tick_size = await live_executor.verify_market(market)
+            metadata = await live_executor.prewarm_order_metadata(market)
+            buy_pool = await live_executor.prepare_buy_order_pool(
+                market, shares=settings.min_shares, tick_size=tick_size,
+            )
+            details = {
+                "condition_id": market.condition_id, "tick_size": str(tick_size),
+                "sdk_metadata_prewarm": metadata, "buy_order_pool": buy_pool,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+            store.record_runtime_event(
+                run_id=run_id, event_type="live_market_prepared", market_key=market.key,
+                venue="polymarket", details=details,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            store.record_runtime_event(
+                run_id=run_id, event_type="live_market_prepare_failed", market_key=market.key,
+                venue="polymarket",
+                details={"condition_id": market.condition_id,
+                         "error_type": type(exc).__name__,
+                         "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3)},
+            )
+            raise
+
+    async def on_market_resolved(market: Market, winner: str, resolved_at: datetime) -> None:
+        settled = engine.resolve_market(market, winner, resolved_at)
+        if settled:
+            print(f"LIVE SETTLED {market.key}; winner={winner}")
+
+    feed = PairMarketFeed(
+        settings, subscription_recorder=record_subscription,
+        market_ready_callback=prepare_live_market if live_executor is not None else None,
+        resolution_callback=on_market_resolved if live_executor is not None else None,
+    )
+    if live_executor is not None:
+        engine.set_current_book_provider(feed.current_book)
     next_clock_sync = start + 3600.0
+    next_live_latency_report = start + 300.0
     notifier: DiscordPnLNotifier | None = None
     notifier_task: asyncio.Task[None] | None = None
     status_logger = _LiveStatusLogger()
     feed_error_logger = _FeedErrorLogger()
-    print("SHADOW MODE ONLY | Polymarket single-leg paper positions; Binance supplies signal data only; no real orders are sent.")
+    if execution_mode == "live":
+        print("LIVE REAL ORDERS | Polymarket single-leg FAK orders are enabled; Binance supplies signal data only.")
+        print(f"Live execution: FAK submit; BUY price cap is best ask + ${settings.live_max_slippage:.2f}; "
+              f"no per-order USDC cap; max book age={settings.live_max_book_age_seconds:g}s; "
+              f"sell FAK floor=$0.01; ledger={db_path}.")
+    else:
+        print("SHADOW MODE ONLY | Polymarket single-leg paper positions; Binance supplies signal data only; no real orders are sent.")
     print(f"rolling={settings.history_window_markets} completed markets, "
           f"min-spread-history={settings.min_history_markets}, "
           f"min-OU-history={settings.min_ou_history_markets}, bucket={settings.bucket_seconds}s, "
@@ -198,13 +287,50 @@ async def _live(settings: Settings, duration: float) -> None:
     print(f"Exit rule: directional OU score returns to ±{settings.ou_exit_threshold:g}; "
           f"maximum hold {settings.max_hold_seconds}s; entry requires at least "
           f"{settings.min_market_time_left_seconds}s left in the market.")
-    print("Paper fill events retain WebSocket source-data age; raw quote/orderbook snapshots are not stored. "
-          "Order-book request RTT is unavailable from the stream.")
-    print("Simulated order delay: fixed 330ms from submit to arrival, with no jitter.")
-    print("At arrival, the first IOC uses the newest in-memory WebSocket book received by that instant; "
-          "it does not wait for a new quote. IOC remainder retries wait for a later book update.")
+    if execution_mode == "live":
+        print("Live ledger stores trade/order events and actual FAK fills; raw quote/orderbook snapshots are not stored.")
+    else:
+        print("Paper fill events retain WebSocket source-data age; raw quote/orderbook snapshots are not stored. "
+              "Order-book request RTT is unavailable from the stream.")
+    if execution_mode == "paper":
+        print("Simulated order delay: fixed 330ms from submit to arrival, with no jitter.")
+        print("At arrival, the first IOC uses the newest in-memory WebSocket book received by that instant; "
+              "it does not wait for a new quote. IOC remainder retries wait for a later book update.")
     try:
+        if live_executor is not None:
+            await live_executor.connect()
         await feed.start()
+        if live_executor is not None:
+            resume_trades = store.open_shadow_trades() + store.settlement_pending_trades()
+            watched: set[str] = set()
+            for trade in resume_trades:
+                market_data = trade.get("resolution_market") or {}
+                try:
+                    market = Market(
+                        venue="polymarket", key=str(market_data["key"]),
+                        label=str(market_data["key"]),
+                        start_at=datetime.fromtimestamp(float(market_data["start_at"]), timezone.utc),
+                        end_at=datetime.fromtimestamp(float(market_data["end_at"]), timezone.utc),
+                        up_token=str(market_data["up_token"]),
+                        down_token=str(market_data["down_token"]),
+                        condition_id=str(market_data["condition_id"]),
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    if trade.get("status") == "SETTLEMENT_PENDING":
+                        print(f"Cannot resume auto-settlement watcher for {trade.get('market_key')}: "
+                              "stored trade predates resolution-market metadata; account redemption is separate.")
+                    continue
+                if market.key in watched:
+                    continue
+                watched.add(market.key)
+                resolution = store.market_resolution(market.key)
+                if resolution is not None:
+                    engine.resolve_market(
+                        market, str(resolution["winning_asset_id"]),
+                        datetime.fromisoformat(str(resolution["resolved_at"])),
+                    )
+                else:
+                    feed.watch_market_resolution(market)
         if settings.discord_webhook_url:
             notifier = DiscordPnLNotifier(
                 store, settings.discord_webhook_url, settings.discord_pnl_interval_seconds
@@ -218,6 +344,21 @@ async def _live(settings: Settings, duration: float) -> None:
             if now >= next_clock_sync:
                 await feed.binance.sync_clock()
                 next_clock_sync = now + 3600.0
+            if live_executor is not None and now >= next_live_latency_report:
+                summary = store.live_order_latency_summary(run_id)
+                metrics = summary.get("metrics", {})
+                fields = []
+                for name in (
+                    "trigger_to_post_start_ms", "intent_to_post_start_ms", "order_create_ms",
+                    "sdk_post_order_call_ms", "post_http_total_ms",
+                ):
+                    values = metrics.get(name)
+                    if values and values.get("p50") is not None:
+                        fields.append(
+                            f"{name}=p50:{values['p50']:.1f}/p90:{values['p90']:.1f}/p99:{values['p99']:.1f}ms"
+                        )
+                print("Live order latency (current run): " + ("; ".join(fields) if fields else "no completed samples"))
+                next_live_latency_report = now + 300.0
             try:
                 remaining = None if duration <= 0 else max(0.0, duration - (now - start))
                 due = engine.next_wakeup_epoch()
@@ -225,7 +366,7 @@ async def _live(settings: Settings, duration: float) -> None:
                 if due is not None and due <= wall_now:
                     arrival_snapshot = feed.snapshot_at(due)
                     if arrival_snapshot is not None:
-                        status = engine.process(arrival_snapshot, evaluate_signals=False)
+                        status = await engine.process_async(arrival_snapshot, evaluate_signals=False)
                         status_logger.log(arrival_snapshot, status)
                         continue
                 until_due = 1.0 if due is None or due <= wall_now else due - wall_now
@@ -238,7 +379,7 @@ async def _live(settings: Settings, duration: float) -> None:
                     if due is not None and due <= time.time():
                         arrival_snapshot = feed.snapshot_at(due)
                         if arrival_snapshot is not None:
-                            status = engine.process(arrival_snapshot, evaluate_signals=False)
+                            status = await engine.process_async(arrival_snapshot, evaluate_signals=False)
                             status_logger.log(arrival_snapshot, status)
                     continue
                 feed_error_logger.recovered()
@@ -249,10 +390,10 @@ async def _live(settings: Settings, duration: float) -> None:
                     arrival_snapshot = feed.snapshot_at(due)
                     if arrival_snapshot is None:
                         break
-                    status = engine.process(arrival_snapshot, evaluate_signals=False)
+                    status = await engine.process_async(arrival_snapshot, evaluate_signals=False)
                     status_logger.log(arrival_snapshot, status)
                     due = engine.next_wakeup_epoch()
-                status = engine.process(snapshot)
+                status = await engine.process_async(snapshot)
                 status_logger.log(snapshot, status)
                 engine.calibration.close_completed(snapshot.captured_at)
             except (FeedError, httpx.HTTPError, OSError, TimeoutError, ValueError) as exc:
@@ -277,14 +418,21 @@ async def _live(settings: Settings, duration: float) -> None:
                             details={"duration_seconds": round(time.monotonic() - start, 3)},
                         )
                     finally:
-                        store.close()
+                        try:
+                            if live_executor is not None:
+                                await live_executor.close()
+                        finally:
+                            store.close()
 
 
 def main() -> None:
     load_dotenv()
     args = _arguments()
     settings = Settings.from_env()
+    execution_mode = args.execution_mode or settings.trading_mode
     if args.mode == "demo":
+        if execution_mode == "live":
+            raise SystemExit("demo is paper-only; use 'live --execution-mode live' to enable real orders")
         demo(settings)
         return
     if args.mode == "import-history":
@@ -352,16 +500,18 @@ def main() -> None:
         print("RV10 history was cleared too; preserved legacy quote ticks will not rebuild it automatically.")
         return
     if args.mode == "report":
-        store = Store(settings.db_path)
+        report_db_path = settings.live_db_path if execution_mode == "live" else settings.db_path
+        store = Store(report_db_path)
         try:
             rows = store.shadow_trade_rows()
             total = len(rows)
             scenario_keys = sorted({str(row["scenario_key"]) for row in rows})
-            closed = [row for row in rows if row["status"] == "CLOSED"]
-            completed = [row for row in rows if row["status"] in {"CLOSED", "NO_PAIR", "NO_POSITION"}
+            closed = [row for row in rows if row["status"] in {"CLOSED", "SETTLED"}]
+            completed = [row for row in rows if row["status"] in {"CLOSED", "SETTLED", "NO_PAIR", "NO_POSITION"}
                          and row["net_pnl"] is not None]
             no_position = sum(row["status"] in {"NO_PAIR", "NO_POSITION"} for row in rows)
             unresolved = sum(str(row["status"]).startswith("UNRESOLVED") for row in rows)
+            settlement_pending = sum(row["status"] == "SETTLEMENT_PENDING" for row in rows)
             full_size = sum(float(row["paired_shares"]) + 1e-9 >= float(row["requested_shares"])
                             for row in rows if float(row["requested_shares"]) > 0)
             any_position = sum(float(row["paired_shares"]) > 1e-9 for row in rows)
@@ -375,12 +525,12 @@ def main() -> None:
                 if row["net_pnl"] is not None:
                     day = datetime.fromtimestamp(float(row["decision_epoch"]), timezone.utc).date().isoformat()
                     daily[day].append(float(row["net_pnl"]))
-            print(f"Shadow report: {settings.db_path}")
+            print(f"{'Live' if execution_mode == 'live' else 'Shadow'} report: {report_db_path}")
             print(f"Signals={total}; position opened={any_position}/{total}; full requested size={full_size}/{total}; "
-                  f"no position={no_position}; unresolved at market end={unresolved}")
+                  f"no position={no_position}; unresolved={unresolved}; settlement pending={settlement_pending}")
             for scenario in scenario_keys:
                 group = [row for row in rows if row["scenario_key"] == scenario]
-                group_done = [row for row in group if row["status"] in {"CLOSED", "NO_PAIR", "NO_POSITION"}
+                group_done = [row for row in group if row["status"] in {"CLOSED", "SETTLED", "NO_PAIR", "NO_POSITION"}
                               and row["net_pnl"] is not None]
                 group_pnls = [float(row["net_pnl"]) for row in group_done]
                 group_rate = (sum(value > 0 for value in group_pnls) / len(group_pnls)) if group_pnls else None
@@ -393,7 +543,7 @@ def main() -> None:
             print(f"Mean requested-size fill ratio={mean_fill_ratio:.1%}" if mean_fill_ratio is not None
                   else "Mean requested-size fill ratio: n/a")
             if closed_pnls:
-                print(f"Closed-only net PnL: total={sum(closed_pnls):+.4f}; mean/trade={mean_pnl:+.4f}; "
+                print(f"Closed/settled net PnL: total={sum(closed_pnls):+.4f}; mean/trade={mean_pnl:+.4f}; "
                       f"win rate={win_rate:.1%}; completed trades={len(closed_pnls)} "
                       f"(closed positions={len(closed)}, no-position records={no_position})")
                 print("Daily closed PnL (UTC): " + "; ".join(
@@ -402,20 +552,28 @@ def main() -> None:
                     for day, values in sorted(daily.items())
                 ))
             else:
-                print("Closed-only net PnL / win rate: n/a")
-            print("Simulated order delay: fixed "
-                  f"{settings.poly_order_network_ms + settings.poly_order_api_ms:g}ms per order; "
-                  f"jitter=0..{settings.order_latency_jitter_ms:g}ms; "
-                  "first IOC uses latest in-memory book as of arrival")
+                print("Closed/settled net PnL / win rate: n/a")
+            if execution_mode == "live":
+                print("Live execution uses current in-memory books immediately and sends FAK orders; "
+                      "unresolved API outcomes require account reconciliation.")
+            else:
+                print("Simulated order delay: fixed "
+                      f"{settings.poly_order_network_ms + settings.poly_order_api_ms:g}ms per order; "
+                      f"jitter=0..{settings.order_latency_jitter_ms:g}ms; "
+                      "first IOC uses latest in-memory book as of arrival")
             print("Live mode keeps books in memory; the database stores trade and runtime events only.")
             if unresolved:
-                print("Unresolved trades are excluded from PnL; no settlement result is invented.")
+                print("Unresolved order outcomes are excluded from PnL and still require account reconciliation.")
+            if settlement_pending:
+                print("Settlement-pending positions are excluded from PnL until Polymarket resolution is recorded.")
         finally:
             store.close()
         return
     try:
-        asyncio.run(_live(settings, args.duration_seconds))
+        asyncio.run(_live(settings, args.duration_seconds, execution_mode))
     except KeyboardInterrupt:
         print("\nStopped.")
     except FeedError as exc:
         raise SystemExit(str(exc)) from exc
+    except (ValueError, RuntimeError, OSError, ImportError) as exc:
+        raise SystemExit(f"Could not start {execution_mode} execution: {exc}") from exc

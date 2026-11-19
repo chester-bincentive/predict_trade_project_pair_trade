@@ -34,6 +34,12 @@ class Settings:
     binance_order_network_ms: float = 330.0
     binance_order_api_ms: float = 0.0
     order_latency_jitter_ms: float = 0.0
+    trading_mode: str = "paper"
+    live_db_path: Path = Path("data/live_pair_trading.sqlite3")
+    live_max_slippage: float = 0.15
+    live_max_book_age_seconds: float = 2.0
+    live_retry_interval_seconds: float = 1.0
+    resolution_grace_seconds: float = 900.0
     discord_webhook_url: str = ""
     discord_pnl_interval_seconds: int = 900
     db_path: Path = Path("data/pair_trading.sqlite3")
@@ -42,6 +48,9 @@ class Settings:
     def from_env(cls) -> "Settings":
         load_dotenv()
         default_db = Path(__file__).resolve().parents[1] / "data" / "pair_trading.sqlite3"
+        trading_mode = os.getenv("PAIR_TRADING_MODE", "paper").strip().lower()
+        if trading_mode not in {"paper", "live"}:
+            raise ValueError("PAIR_TRADING_MODE must be paper or live")
         settings = cls(
             poll_seconds=_float_env("PAIR_POLL_SECONDS", 1.0, minimum=0.1),
             match_tolerance_seconds=_float_env("PAIR_MATCH_TOLERANCE_SECONDS", 2.0, minimum=0.0),
@@ -67,6 +76,18 @@ class Settings:
             binance_order_network_ms=_float_env("PAIR_BINANCE_ORDER_NETWORK_MS", 330.0, minimum=0.0),
             binance_order_api_ms=_float_env("PAIR_BINANCE_ORDER_API_MS", 0.0, minimum=0.0),
             order_latency_jitter_ms=_float_env("PAIR_ORDER_LATENCY_JITTER_MS", 0.0, minimum=0.0),
+            trading_mode=trading_mode,
+            live_db_path=Path(os.getenv(
+                "PAIR_LIVE_DB_PATH", str(default_db.with_name("live_pair_trading.sqlite3"))
+            )),
+            live_max_slippage=_float_env("PAIR_LIVE_MAX_SLIPPAGE", 0.15, minimum=0.0),
+            live_max_book_age_seconds=_float_env("PAIR_LIVE_MAX_BOOK_AGE_SECONDS", 2.0, minimum=0.1),
+            live_retry_interval_seconds=_float_env(
+                "PAIR_LIVE_RETRY_INTERVAL_SECONDS", 1.0, minimum=0.1
+            ),
+            resolution_grace_seconds=_float_env(
+                "PAIR_RESOLUTION_GRACE_SECONDS", 900.0, minimum=0.0
+            ),
             discord_webhook_url=os.getenv("PAIR_DISCORD_WEBHOOK_URL", "").strip(),
             discord_pnl_interval_seconds=_int_env(
                 "PAIR_DISCORD_PNL_INTERVAL_SECONDS", 900, minimum=60
@@ -81,6 +102,10 @@ class Settings:
             raise ValueError("PAIR_MIN_RV_HISTORY_MARKETS cannot exceed PAIR_RV_HISTORY_WINDOW_MARKETS")
         if settings.ou_exit_threshold >= settings.ou_entry_threshold:
             raise ValueError("PAIR_OU_EXIT_THRESHOLD must be below PAIR_OU_ENTRY_THRESHOLD")
+        if settings.live_max_slippage >= 0.99:
+            raise ValueError("PAIR_LIVE_MAX_SLIPPAGE must be below 0.99")
+        if settings.live_db_path.resolve() == settings.db_path.resolve():
+            raise ValueError("PAIR_LIVE_DB_PATH must be separate from PAIR_DB_PATH")
         return settings
 
 

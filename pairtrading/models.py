@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +54,38 @@ class Market:
     down_token: str
     up_market_id: str | None = None
     down_market_id: str | None = None
+    condition_id: str | None = None
+    min_order_size: float = 5.0
+
+    @property
+    def slug(self) -> str:
+        return self.key
+
+    @property
+    def up_asset_id(self) -> str:
+        return self.up_token
+
+    @property
+    def down_asset_id(self) -> str:
+        return self.down_token
+
+    @property
+    def start_ns(self) -> int:
+        return int(self.start_at.timestamp() * 1_000_000_000)
+
+    @property
+    def end_ns(self) -> int:
+        return int(self.end_at.timestamp() * 1_000_000_000)
+
+
+@dataclass(frozen=True, slots=True)
+class Fill:
+    requested_qty: float
+    filled_qty: float
+    notional: float
+    fee: float
+    vwap: float
+    levels: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True, slots=True)

@@ -50,6 +50,10 @@ class LiveFakNoFill(RuntimeError):
         self.diagnostic_fields = dict(diagnostic_fields or {})
 
 
+class LiveBalanceAllowanceRejected(LiveFakNoFill):
+    """A sell was definitively rejected because shares or allowance were unavailable."""
+
+
 _SENSITIVE_HEX_RE = re.compile(r"(?i)\b0x[a-f0-9]{40,64}\b")
 _FAK_NO_FILL_MESSAGE = (
     "no orders found to match with fak order. "
@@ -92,6 +96,31 @@ def _is_explicit_fak_no_fill_response(response: Any) -> bool:
         str(_field(response, "message", "error", default="") or "").strip().casefold().split()
     )
     return message == _FAK_NO_FILL_MESSAGE or message.startswith(_FAK_NO_FILL_MESSAGE_PREFIX)
+
+
+_BALANCE_ALLOWANCE_REJECTION_PHRASES = (
+    "not enough balance / allowance",
+    "balance is not enough",
+    "allowance is not enough",
+    "insufficient balance",
+    "insufficient allowance",
+    "not enough balance",
+    "not enough allowance",
+)
+
+
+def _contains_balance_allowance_rejection(value: Any) -> bool:
+    message = " ".join(str(value or "").strip().casefold().split())
+    return any(phrase in message for phrase in _BALANCE_ALLOWANCE_REJECTION_PHRASES)
+
+
+def _is_explicit_balance_allowance_rejection(exc: Exception) -> bool:
+    return getattr(exc, "status", None) == 400 and _contains_balance_allowance_rejection(exc)
+
+
+def _is_explicit_balance_allowance_rejection_response(response: Any) -> bool:
+    message = _field(response, "message", "error", "error_msg", "errorMsg", default="")
+    return _contains_balance_allowance_rejection(message)
 
 
 def _field(value: Any, *names: str, default: Any = None) -> Any:
@@ -1030,6 +1059,17 @@ class PolymarketLiveExecutor:
             diagnostics = _request_rejection_diagnostics(exc)
             diagnostics.update(signed_details)
             diagnostics["live_order_timing"] = dict(timing_context or {})
+            if side.upper() == "SELL" and _is_explicit_balance_allowance_rejection(exc):
+                diagnostics["sdk_rejection_kind"] = "insufficient_balance_or_allowance"
+                diagnostics["outcome_unknown"] = False
+                logger.warning(
+                    "LIVE_CLOB_SELL_BALANCE_ALLOWANCE_REJECTED status=%s; sell will retry",
+                    diagnostics.get("sdk_status"),
+                )
+                raise LiveBalanceAllowanceRejected(
+                    "SELL FAK was explicitly rejected because balance or allowance was unavailable",
+                    diagnostic_fields=diagnostics,
+                ) from exc
             if _is_explicit_fak_no_fill(exc):
                 diagnostics["sdk_rejection_kind"] = "fak_not_filled"
                 diagnostics["outcome_unknown"] = False
@@ -1085,6 +1125,14 @@ class PolymarketLiveExecutor:
         details["live_order_timing"] = dict(timing_context or {})
         _ACTIVE_ORDER_TRACE.reset(token)
         if not accepted:
+            if side.upper() == "SELL" and _is_explicit_balance_allowance_rejection_response(response):
+                details["sdk_rejection_kind"] = "insufficient_balance_or_allowance"
+                details["outcome_unknown"] = False
+                logger.warning("LIVE_CLOB_SELL_BALANCE_ALLOWANCE_REJECTED response; sell will retry")
+                raise LiveBalanceAllowanceRejected(
+                    "SELL FAK was explicitly rejected because balance or allowance was unavailable",
+                    diagnostic_fields=details,
+                )
             if _is_explicit_fak_no_fill_response(response):
                 details["sdk_rejection_kind"] = "fak_not_filled"
                 details["outcome_unknown"] = False

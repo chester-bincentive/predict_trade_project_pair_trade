@@ -9,7 +9,12 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Callable
 
 from .config import Settings
-from .live_execution import LiveFakNoFill, LiveOrderUnknown, PolymarketLiveExecutor
+from .live_execution import (
+    LiveBalanceAllowanceRejected,
+    LiveFakNoFill,
+    LiveOrderUnknown,
+    PolymarketLiveExecutor,
+)
 from .models import Book, Market, PairSnapshot
 from .storage import Store
 from .strategy import RollingCalibration, event_bucket, mid_spread
@@ -702,17 +707,25 @@ class ShadowEngine:
                     self._persist()
                     raise
                 except LiveFakNoFill as exc:
+                    balance_allowance_rejected = isinstance(exc, LiveBalanceAllowanceRejected)
                     details = {**attempt_details, **exc.diagnostic_fields,
                                "error_type": type(exc).__name__, "error": str(exc),
                                "outcome_unknown": False,
                                "live_order_timing": dict(timing_context)}
-                    self._event(state, phase, leg, side=side, status="LIVE_FAK_NO_FILL",
+                    if balance_allowance_rejected:
+                        details["retryable"] = phase in {"EXIT", "UNWIND"}
+                        details["retry_policy"] = "retry after live interval and a fresh book update"
+                    event_status = (
+                        "LIVE_SELL_BALANCE_RETRY" if balance_allowance_rejected and side == "SELL"
+                        else "LIVE_FAK_NO_FILL"
+                    )
+                    self._event(state, phase, leg, side=side, status=event_status,
                                 requested=remaining, filled=0.0, notional=0.0, fee=0.0,
                                 book=book, order=order, details=details)
                     if phase == "ENTRY" and attempt_number == 1:
                         order["last_no_fill_ns"] = time.time_ns()
                         continue
-                    if phase == "EXIT":
+                    if phase == "EXIT" and not balance_allowance_rejected:
                         order["live_fak_no_fill_confirmed"] = True
                     order["live_result_recorded"] = True
                     order["live_result"] = {"filled": 0.0, "notional": 0.0, "fee": 0.0}
@@ -1156,6 +1169,9 @@ class ShadowEngine:
         state["settlement_payout"] = payout
         state["settlement_at"] = resolved_at
         state["status"] = "SETTLED"
+        state["live_order_unknown"] = False
+        state.pop("live_order_unknown_phase", None)
+        state["live_position_unresolved"] = False
         state["net_pnl"] = (
             float(state.get("exit_value", 0.0)) - float(state.get("exit_fee", 0.0))
             + payout - float(state.get("entry_cost", 0.0)) - float(state.get("entry_fee", 0.0))

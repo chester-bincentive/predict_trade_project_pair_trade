@@ -333,7 +333,13 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                     feed.watch_market_resolution(market)
         if settings.discord_webhook_url:
             notifier = DiscordPnLNotifier(
-                store, settings.discord_webhook_url, settings.discord_pnl_interval_seconds
+                store,
+                settings.discord_webhook_url,
+                settings.discord_pnl_interval_seconds,
+                trading_mode=execution_mode,
+                collateral_balance_provider=(
+                    None if live_executor is None else live_executor.get_collateral_balance
+                ),
             )
             notifier_task = asyncio.create_task(notifier.run(), name="discord-pnl-notifier")
             print(f"Discord PnL notifications enabled; interval={settings.discord_pnl_interval_seconds}s.")

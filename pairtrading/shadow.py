@@ -1349,6 +1349,13 @@ class ShadowEngine:
         if self.active is None:
             return None
         state = self.active
+        # An unresolved live order/position cannot be advanced by replaying its
+        # stale order deadline. Let the feed loop keep receiving fresh markets
+        # so a later market boundary or account reconciliation can unlock it.
+        if self.live_executor is not None and (
+            state.get("live_order_unknown") or state.get("live_position_unresolved")
+        ):
+            return None
         due: list[float] = []
         for leg in state["legs"]:
             if not leg["entry_attempted"]:

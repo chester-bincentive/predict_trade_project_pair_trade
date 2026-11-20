@@ -187,6 +187,9 @@ class PolymarketLiveExecutor:
         self._prepared_buy_pool_ready: set[tuple[str, str, str]] = set()
         self._prepared_buy_pool_preparing: set[tuple[str, str, str]] = set()
         self._prepared_buy_refills_inflight: set[tuple[str, str, str]] = set()
+        self._prepared_sell_orders: dict[
+            tuple[str, str, str, str], tuple[Any, int]
+        ] = {}
 
     async def connect(self) -> None:
         from polymarket import AsyncSecureClient, RelayerApiKey
@@ -361,6 +364,82 @@ class PolymarketLiveExecutor:
             self._prepared_buy_refills_inflight.discard(key)
             _ACTIVE_ORDER_TRACE.reset(trace_token)
 
+    async def prepare_sell_order_pool(
+        self,
+        market: Market,
+        *,
+        asset_id: str,
+        shares: float,
+        limit_price: Decimal | str,
+        tick_size: Decimal | str,
+    ) -> dict[str, Any]:
+        """Pre-sign a one-use SELL FAK for this exact position size and floor price."""
+        if self.client is None:
+            raise RuntimeError("Polymarket account is not connected")
+        self._prune_expired_prepared_sell_orders()
+        size = f"{shares:.6f}"
+        price = Decimal(str(limit_price))
+        tick = Decimal(str(tick_size))
+        if not price.is_finite() or not Decimal("0") < price < Decimal("1"):
+            raise ValueError("SELL FAK limit price must be between 0 and 1")
+        if not tick.is_finite() or tick <= 0 or tick >= 1 or price % tick != 0:
+            raise ValueError("SELL FAK limit price must conform to the current tick size")
+        verified = self._verified_markets.get(market.condition_id.lower())
+        if verified is None or str(asset_id) not in verified[0] | verified[1]:
+            raise ValueError("market condition and outcome asset must be account-verified before presigning")
+        key = self._prepared_sell_order_key(asset_id, size, price, tick)
+        if key in self._prepared_sell_orders:
+            return {"status": "already_ready", "prepared_orders": 0, "tick_size": format(tick, "f")}
+        if market.end_ns <= time.time_ns():
+            return {"status": "market_expired", "prepared_orders": 0, "tick_size": format(tick, "f")}
+
+        started_ns = time.perf_counter_ns()
+        trace_token = _ACTIVE_ORDER_TRACE.set(None)
+        try:
+            signed_order = await self.client.create_limit_order(
+                asset_id=str(asset_id), side="SELL", price=format(price, "f"),
+                size=size, post_only=False,
+            )
+            self._prepared_sell_orders[key] = (
+                replace(signed_order, order_type="FAK"), market.end_ns,
+            )
+            return {
+                "status": "ready", "prepared_orders": 1,
+                "tick_size": format(tick, "f"),
+                "prepare_elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
+            }
+        finally:
+            _ACTIVE_ORDER_TRACE.reset(trace_token)
+
+    @staticmethod
+    def _prepared_sell_order_key(
+        asset_id: str, size: str, price: Decimal | str, tick_size: Decimal | str,
+    ) -> tuple[str, str, str, str]:
+        return (
+            str(asset_id), size, format(Decimal(str(price)), "f"),
+            format(Decimal(str(tick_size)), "f"),
+        )
+
+    def _take_prepared_sell_order(
+        self, asset_id: str, size: str, price: Decimal, tick_size: Decimal | str | None,
+    ) -> Any | None:
+        if tick_size is None:
+            return None
+        key = self._prepared_sell_order_key(asset_id, size, price, tick_size)
+        cached = self._prepared_sell_orders.pop(key, None)
+        if cached is None:
+            return None
+        order, expires_ns = cached
+        if expires_ns <= time.time_ns():
+            return None
+        return order
+
+    def _prune_expired_prepared_sell_orders(self) -> None:
+        now_ns = time.time_ns()
+        for key, (_, expires_ns) in list(self._prepared_sell_orders.items()):
+            if expires_ns <= now_ns:
+                self._prepared_sell_orders.pop(key, None)
+
     async def prepare_buy_order_pool(
         self,
         market: Market,
@@ -464,6 +543,7 @@ class PolymarketLiveExecutor:
         for key in expired_pools:
             self._prepared_buy_pool_specs.pop(key, None)
             self._prepared_buy_pool_ready.discard(key)
+        self._prune_expired_prepared_sell_orders()
 
     @staticmethod
     def _capture_http_request(service: str, request: Any) -> None:
@@ -721,6 +801,7 @@ class PolymarketLiveExecutor:
         self._prepared_buy_pool_ready.clear()
         self._prepared_buy_pool_preparing.clear()
         self._prepared_buy_refills_inflight.clear()
+        self._prepared_sell_orders.clear()
         context = self._client_context
         self.client = None
         self._client_context = None
@@ -906,6 +987,7 @@ class PolymarketLiveExecutor:
         asset_id: str,
         requested_qty: float,
         limit_price: str = "0.01",
+        tick_size: Decimal | str | None = None,
         on_order_signed: Callable[[dict[str, Any]], None] | None = None,
         timing_context: dict[str, Any] | None = None,
     ) -> tuple[bool, Fill | None, dict[str, Any]]:
@@ -915,6 +997,7 @@ class PolymarketLiveExecutor:
             requested_qty=requested_qty,
             shares=requested_qty,
             limit_price=limit_price,
+            tick_size=tick_size,
             on_order_signed=on_order_signed,
             timing_context=timing_context,
         )
@@ -927,6 +1010,7 @@ class PolymarketLiveExecutor:
         requested_qty: float,
         shares: float,
         limit_price: Decimal | str | float,
+        tick_size: Decimal | str | None = None,
         on_order_signed: Callable[[dict[str, Any]], None] | None = None,
         timing_context: dict[str, Any] | None = None,
     ) -> tuple[bool, Fill | None, dict[str, Any]]:
@@ -955,7 +1039,10 @@ class PolymarketLiveExecutor:
             fak_order = (
                 self._take_prepared_buy_order(asset_id, size_text, limit_price_decimal)
                 if side.upper() == "BUY"
-                else None
+                else self._take_prepared_sell_order(
+                    asset_id, size_text, limit_price_decimal,
+                    None if tick_size is None else Decimal(str(tick_size)),
+                )
             )
             if fak_order is not None:
                 order_prepare_source = "pre_signed_pool"

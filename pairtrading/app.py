@@ -172,6 +172,39 @@ class _FeedErrorLogger:
             self.last_logged_at = 0.0
 
 
+async def _run_live_exit_watchdog(
+    engine: ShadowEngine,
+    feed: PairMarketFeed,
+    settings: Settings,
+) -> None:
+    """Drive live max-hold and sell retries without waiting for Binance books."""
+    last_error_key: str | None = None
+    last_error_at = 0.0
+    while True:
+        deadline = engine.next_live_exit_wakeup_epoch()
+        now = time.time()
+        if deadline is None or deadline > now:
+            delay = 0.25 if deadline is None else min(0.25, max(0.01, deadline - now))
+            await asyncio.sleep(delay)
+            continue
+        try:
+            status = await engine.process_live_exit_due(feed.current_polymarket_market())
+            if status and not status.startswith("LIVE EXIT pending"):
+                print(status, flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error_key = type(exc).__name__
+            if error_key != last_error_key or time.monotonic() - last_error_at >= 60.0:
+                print(f"LIVE EXIT WATCHDOG ERROR ({error_key}); retrying", flush=True)
+                last_error_key = error_key
+                last_error_at = time.monotonic()
+        else:
+            last_error_key = None
+            last_error_at = 0.0
+        await asyncio.sleep(min(0.25, max(0.05, settings.live_retry_interval_seconds / 4.0)))
+
+
 async def _live(settings: Settings, duration: float, execution_mode: str = "paper") -> None:
     if execution_mode not in {"paper", "live"}:
         raise ValueError("execution mode must be paper or live")
@@ -236,6 +269,9 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
             details = {
                 "condition_id": market.condition_id, "tick_size": str(tick_size),
                 "sdk_metadata_prewarm": metadata, "buy_order_pool": buy_pool,
+                "recovered_sell_order_pools": await engine.prepare_open_live_sell_orders(
+                    market, tick_size,
+                ),
                 "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
             }
             store.record_runtime_event(
@@ -255,7 +291,7 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
             raise
 
     async def on_market_resolved(market: Market, winner: str, resolved_at: datetime) -> None:
-        settled = engine.resolve_market(market, winner, resolved_at)
+        settled = await engine.resolve_market_async(market, winner, resolved_at)
         if settled:
             print(f"LIVE SETTLED {market.key}; winner={winner}")
 
@@ -270,6 +306,7 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
     next_live_latency_report = start + 300.0
     notifier: DiscordPnLNotifier | None = None
     notifier_task: asyncio.Task[None] | None = None
+    exit_watchdog_task: asyncio.Task[None] | None = None
     status_logger = _LiveStatusLogger()
     feed_error_logger = _FeedErrorLogger()
     if execution_mode == "live":
@@ -292,6 +329,7 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
           f"{settings.min_market_time_left_seconds}s left in the market.")
     if execution_mode == "live":
         print("Live ledger stores trade/order events and actual FAK fills; raw quote/orderbook snapshots are not stored.")
+        print("Live max-hold exits use an independent clock; sell attempts use fresh Polymarket books only.")
     else:
         print("Paper fill events retain WebSocket source-data age; raw quote/orderbook snapshots are not stored. "
               "Order-book request RTT is unavailable from the stream.")
@@ -334,6 +372,10 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                     )
                 else:
                     feed.watch_market_resolution(market)
+            exit_watchdog_task = asyncio.create_task(
+                _run_live_exit_watchdog(engine, feed, settings),
+                name="live-polymarket-exit-watchdog",
+            )
         if settings.discord_webhook_url:
             notifier = DiscordPnLNotifier(
                 store,
@@ -410,28 +452,33 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                 await asyncio.sleep(settings.poll_seconds)
     finally:
         try:
-            if notifier_task is not None:
-                notifier_task.cancel()
-                await asyncio.gather(notifier_task, return_exceptions=True)
+            if exit_watchdog_task is not None:
+                exit_watchdog_task.cancel()
+                await asyncio.gather(exit_watchdog_task, return_exceptions=True)
         finally:
             try:
-                if notifier is not None:
-                    await notifier.close()
+                if notifier_task is not None:
+                    notifier_task.cancel()
+                    await asyncio.gather(notifier_task, return_exceptions=True)
             finally:
                 try:
-                    await feed.close()
+                    if notifier is not None:
+                        await notifier.close()
                 finally:
                     try:
-                        store.record_runtime_event(
-                            run_id=run_id, event_type="run_stopped",
-                            details={"duration_seconds": round(time.monotonic() - start, 3)},
-                        )
+                        await feed.close()
                     finally:
                         try:
-                            if live_executor is not None:
-                                await live_executor.close()
+                            store.record_runtime_event(
+                                run_id=run_id, event_type="run_stopped",
+                                details={"duration_seconds": round(time.monotonic() - start, 3)},
+                            )
                         finally:
-                            store.close()
+                            try:
+                                if live_executor is not None:
+                                    await live_executor.close()
+                            finally:
+                                store.close()
 
 
 def main() -> None:

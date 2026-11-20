@@ -446,6 +446,10 @@ class PairMarketFeed:
         """Return the latest mutable in-memory L2 view for live execution."""
         return self._books.get((venue, outcome))
 
+    def current_polymarket_market(self) -> Market | None:
+        """Return the Polymarket market whose outcome books are currently streamed."""
+        return None if self._active_pair is None else self._active_pair[0]
+
     def watch_market_resolution(self, market: Market) -> None:
         self._start_resolution_watcher(market)
 

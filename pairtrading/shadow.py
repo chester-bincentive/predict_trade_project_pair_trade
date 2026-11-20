@@ -72,6 +72,7 @@ class ShadowEngine:
         self.active: dict[str, Any] | None = next(iter(store.open_shadow_trades()), None)
         self.rng = random.SystemRandom()
         self.current_book_provider: Callable[[str, str], Book | None] | None = None
+        self._process_lock = asyncio.Lock()
         if live_executor is not None and self.active is not None:
             if self.active.get("trading_mode") != "live":
                 raise ValueError("live mode will not resume an open paper/shadow trade")
@@ -85,6 +86,14 @@ class ShadowEngine:
         return asyncio.run(self.process_async(snapshot, evaluate_signals=evaluate_signals))
 
     async def process_async(self, snapshot: PairSnapshot, *, evaluate_signals: bool = True) -> str:
+        async with self._process_lock:
+            return await self._process_async_unlocked(
+                snapshot, evaluate_signals=evaluate_signals,
+            )
+
+    async def _process_async_unlocked(
+        self, snapshot: PairSnapshot, *, evaluate_signals: bool = True,
+    ) -> str:
         now = snapshot.captured_at
         elapsed = (now - snapshot.start_at).total_seconds()
         bucket = event_bucket(elapsed, self.settings.bucket_seconds)
@@ -288,12 +297,39 @@ class ShadowEngine:
     def set_current_book_provider(self, provider: Callable[[str, str], Book | None]) -> None:
         self.current_book_provider = provider
 
-    def _current_book(self, snapshot: PairSnapshot, leg: dict[str, Any]) -> Book:
+    async def prepare_open_live_sell_orders(
+        self, market: Market, tick_size: Decimal | str,
+    ) -> int:
+        """Restore sell presigns for an open live position when its market feed returns."""
+        if self.live_executor is None:
+            return 0
+        async with self._process_lock:
+            state = self.active
+            if (
+                state is None or state.get("market_key") != market.key
+                or not state.get("entries_resolved")
+                or float(state.get("paired_shares", 0.0)) <= 1e-9
+            ):
+                return 0
+            prepared = 0
+            for leg in state["legs"]:
+                remaining = float(leg.get("exit_remaining", 0.0))
+                if remaining > 1e-9:
+                    await self._prepare_live_sell_order(
+                        state, leg, market, remaining, str(tick_size),
+                    )
+                    prepared += 1
+            return prepared
+
+    def _current_book(self, snapshot: PairSnapshot | None, leg: dict[str, Any]) -> Book | None:
         if self.live_executor is not None and self.current_book_provider is not None:
             book = self.current_book_provider(leg["venue"], leg["outcome"])
-            if book is not None:
+            if book is not None and str(book.token_id) == str(leg["token_id"]):
                 return book
-        return snapshot.book(leg["venue"], leg["outcome"])
+        if snapshot is None:
+            return None
+        book = snapshot.book(leg["venue"], leg["outcome"])
+        return book if str(book.token_id) == str(leg["token_id"]) else None
 
     def _delay_components(self, venue: str) -> tuple[float, float, float]:
         if venue == "polymarket":
@@ -359,8 +395,9 @@ class ShadowEngine:
         })
 
     async def _attempt(self, state: dict[str, Any], leg: dict[str, Any], phase: str,
-                       remaining: float, order: dict[str, Any], snapshot: PairSnapshot,
-                       snapshot_ids: dict[tuple[str, str], int]) -> tuple[float, float, float] | None:
+                       remaining: float, order: dict[str, Any], snapshot: PairSnapshot | None,
+                       snapshot_ids: dict[tuple[str, str], int],
+                       market: Market | None = None) -> tuple[float, float, float] | None:
         if self.live_executor is not None:
             if order.get("live_result_recorded"):
                 result = order["live_result"]
@@ -375,19 +412,33 @@ class ShadowEngine:
                                      "manual_account_reconciliation_required": True})
                 self._persist()
                 return None
+        market = market or (None if snapshot is None else snapshot.polymarket)
         book = self._current_book(snapshot, leg)
         wait_for_update = bool(order.get("wait_for_update", False))
         if self.live_executor is not None:
             # Live orders use the newest in-memory book as soon as the strategy
             # evaluates it. Only a retry waits for its cooldown and a later book.
-            if wait_for_update and (
-                time.time() + 1e-6 < order["arrival"]
-                or book.received_at.timestamp() + 1e-6 < order["created"]
-            ):
-                return None
+            if book is None:
+                if wait_for_update and time.time() + 1e-6 < order["arrival"]:
+                    return None
+                self._event(
+                    state, phase, leg, side="BUY" if phase == "ENTRY" else "SELL",
+                    status="LIVE_EXIT_BOOK_UNAVAILABLE" if phase != "ENTRY" else "LIVE_ENTRY_BOOK_UNAVAILABLE",
+                    requested=remaining, order=order,
+                    details={"reason": "current Polymarket order book is not seeded"},
+                )
+                self._persist()
+                return 0.0, 0.0, 0.0
+            if wait_for_update:
+                if time.time() + 1e-6 < order["arrival"]:
+                    return None
+                if book.received_at.timestamp() + 1e-6 < order["created"]:
+                    order["arrival"] = time.time() + self.settings.live_retry_interval_seconds
+                    self._persist()
+                    return None
             fresh = book.age_seconds(datetime.now(timezone.utc)) <= self.settings.live_max_book_age_seconds
             no_book_reason = "current in-memory WebSocket book is stale"
-        elif snapshot.captured_at.timestamp() + 1e-6 < order["arrival"]:
+        elif snapshot is None or snapshot.captured_at.timestamp() + 1e-6 < order["arrival"]:
             return None
         elif wait_for_update:
             if book.received_at.timestamp() + 1e-6 < order["arrival"]:
@@ -421,6 +472,8 @@ class ShadowEngine:
             return 0.0, 0.0, 0.0
         side = "BUY" if phase == "ENTRY" else "SELL"
         if self.live_executor is not None:
+            if market is None:
+                raise RuntimeError("live order processing needs the verified Polymarket market")
             if leg["venue"] != "polymarket":
                 state["live_order_unknown"] = True
                 state["live_order_unknown_phase"] = phase
@@ -447,11 +500,12 @@ class ShadowEngine:
                                          "minimum_seconds_left": self.settings.min_market_time_left_seconds})
                     return 0.0, 0.0, 0.0
             try:
-                tick_size = await self.live_executor.verify_market(snapshot.polymarket)
-                await self.live_executor.prewarm_order_metadata(snapshot.polymarket)
+                tick_size = await self.live_executor.verify_market(market)
+                order["live_tick_size"] = str(tick_size)
+                await self.live_executor.prewarm_order_metadata(market)
                 if phase == "ENTRY":
                     await self.live_executor.prepare_buy_order_pool(
-                        snapshot.polymarket, shares=remaining, tick_size=tick_size,
+                        market, shares=remaining, tick_size=tick_size,
                     )
             except asyncio.CancelledError:
                 raise
@@ -470,6 +524,15 @@ class ShadowEngine:
                 return 0.0, 0.0, 0.0
             book = self._current_book(snapshot, leg)
             now = datetime.now(timezone.utc)
+            if book is None:
+                self._event(
+                    state, phase, leg, side=side,
+                    status="LIVE_EXIT_BOOK_UNAVAILABLE" if phase != "ENTRY" else "LIVE_ENTRY_BOOK_UNAVAILABLE",
+                    requested=remaining, order=order,
+                    details={"reason": "Polymarket order book cleared during market verification"},
+                )
+                self._persist()
+                return 0.0, 0.0, 0.0
             if phase == "ENTRY":
                 seconds_left = float(state["market_end"]) - now.timestamp()
                 if seconds_left <= self.settings.min_market_time_left_seconds:
@@ -498,7 +561,7 @@ class ShadowEngine:
                 return 0.0, 0.0, 0.0
             if phase == "ENTRY":
                 min_live_shares = max(5.0, self.settings.min_shares,
-                                      float(snapshot.polymarket.min_order_size))
+                                      float(market.min_order_size))
                 if remaining + 1e-9 < min_live_shares:
                     order["live_result_recorded"] = True
                     order["live_result"] = {"filled": 0.0, "notional": 0.0, "fee": 0.0}
@@ -548,7 +611,7 @@ class ShadowEngine:
                     return 0.0, 0.0, 0.0
             else:
                 limit_price = Decimal("0.01")
-                min_live_shares = max(5.0, float(snapshot.polymarket.min_order_size))
+                min_live_shares = max(5.0, float(market.min_order_size))
                 if remaining + 1e-9 < min_live_shares:
                     state["live_position_unresolved"] = True
                     state["status"] = "UNRESOLVED_LIVE_POSITION"
@@ -692,7 +755,8 @@ class ShadowEngine:
                     else:
                         accepted, fill, response_details = await self.live_executor.sell_fak(
                             asset_id=leg["token_id"], requested_qty=remaining,
-                            limit_price="0.01", on_order_signed=record_signed_order,
+                            limit_price="0.01", tick_size=tick_size,
+                            on_order_signed=record_signed_order,
                             timing_context=timing_context,
                         )
                 except asyncio.CancelledError:
@@ -792,19 +856,77 @@ class ShadowEngine:
                                  (book.received_at.timestamp() - order["arrival"]) * 1000.0, 3)})
         return filled, notional, fee
 
-    async def _advance(self, snapshot: PairSnapshot, snapshot_ids: dict[tuple[str, str], int],
-                       bucket: int, spread: float | None) -> str | None:
+    async def _prepare_live_sell_order(
+        self,
+        state: dict[str, Any],
+        leg: dict[str, Any],
+        market: Market,
+        shares: float,
+        tick_size: Any,
+    ) -> None:
+        if self.live_executor is None or tick_size is None or shares <= 1e-9:
+            return
+        minimum = max(5.0, float(market.min_order_size))
+        if shares + 1e-9 < minimum:
+            return
+        try:
+            result = await self.live_executor.prepare_sell_order_pool(
+                market, asset_id=leg["token_id"], shares=shares,
+                limit_price="0.01", tick_size=str(tick_size),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._event(
+                state, "SELL_PRESIGN", leg, side="SELL",
+                status="LIVE_SELL_PRESIGN_FAILED", requested=shares,
+                details={"error_type": type(exc).__name__,
+                         "reason": "sell will fall back to on-demand signing"},
+            )
+            self._persist()
+            return
+        if result.get("status") == "ready":
+            self._event(
+                state, "SELL_PRESIGN", leg, side="SELL",
+                status="LIVE_SELL_PRESIGNED", requested=shares,
+                details={**result, "limit_price": "0.01",
+                         "note": "signed order only; no sell was submitted"},
+            )
+            self._persist()
+
+    async def _advance(self, snapshot: PairSnapshot | None,
+                       snapshot_ids: dict[tuple[str, str], int],
+                       bucket: int, spread: float | None, *,
+                       market: Market | None = None,
+                       captured_at: datetime | None = None) -> str | None:
         assert self.active is not None
         state = self.active
         if state.get("live_order_unknown"):
             return "LIVE ORDER RESULT UNKNOWN; trading locked until the Polymarket account is reconciled"
-        now = snapshot.captured_at.timestamp()
+        market = market or (None if snapshot is None else snapshot.polymarket)
+        captured_at = captured_at or (None if snapshot is None else snapshot.captured_at)
+        if market is None or captured_at is None:
+            raise RuntimeError("trade advancement needs a market and decision timestamp")
+        now = captured_at.timestamp()
         dirty = False
         if now >= float(state["market_end"]):
             if self.live_executor is not None and float(state.get("paired_shares", 0.0)) > 1e-9:
+                max_hold_due = state.get("max_hold_due_epoch")
+                if (not state.get("exit_triggered") and max_hold_due is not None
+                        and float(max_hold_due) <= now):
+                    state["exit_triggered"] = True
+                    state["exit_reason"] = "max_hold"
+                    state["exit_trigger_epoch"] = now
+                    self._event(
+                        state, "EXIT_RULE", None, side=None,
+                        status="MAX_HOLD_EXIT_MISSED_MARKET_END",
+                        details={"reason": "max_hold", "trigger_source": "max_hold_clock",
+                                 "execution_book_source": "polymarket_only",
+                                 "reason_not_closed": "market ended with position still open"},
+                    )
                 state["status"] = "SETTLEMENT_PENDING"
                 state["live_position_unresolved"] = False
-                state["closed_at"] = snapshot.captured_at.isoformat()
+                state["closed_at"] = captured_at.isoformat()
                 self._event(state, "TRADE", None, side=None,
                             status="SETTLEMENT_PENDING",
                             details={"position_shares": state["paired_shares"],
@@ -820,7 +942,7 @@ class ShadowEngine:
                 state["net_pnl"] = 0.0
                 state["closed_at"] = (datetime.now(timezone.utc).isoformat()
                                        if self.live_executor is not None
-                                       else snapshot.captured_at.isoformat())
+                                       else captured_at.isoformat())
                 self._event(state, "TRADE", None, side=None, status="NO_POSITION",
                             details={"position_shares": 0.0,
                                      "reason": "market ended before a live fill"})
@@ -828,7 +950,7 @@ class ShadowEngine:
                 self.active = None
                 return "LIVE NO POSITION; market ended before a live fill"
             state["status"] = "UNRESOLVED_AT_END"
-            state["closed_at"] = snapshot.captured_at.isoformat()
+            state["closed_at"] = captured_at.isoformat()
             unresolved_details = {"net_pnl": None}
             unresolved_details[
                 "position_shares" if state.get("execution_mode") == "polymarket_only"
@@ -848,7 +970,8 @@ class ShadowEngine:
                 continue
             order = leg["entry_order"]
             attempt = await self._attempt(
-                state, leg, "ENTRY", float(order["requested"]), order, snapshot, snapshot_ids
+                state, leg, "ENTRY", float(order["requested"]), order, snapshot, snapshot_ids,
+                market=market,
             )
             if state.get("live_order_unknown"):
                 return "LIVE ORDER RESULT UNKNOWN; trading locked until the Polymarket account is reconciled"
@@ -894,6 +1017,12 @@ class ShadowEngine:
                 leg["exit_remaining"] = paired
             state["entries_resolved"] = True
             dirty = True
+            if self.live_executor is not None and paired > 1e-9:
+                for leg in state["legs"]:
+                    await self._prepare_live_sell_order(
+                        state, leg, market, float(leg["exit_remaining"]),
+                        leg.get("entry_order", {}).get("live_tick_size"),
+                    )
             if paired + 1e-9 < float(state["requested_shares"]):
                 if state.get("execution_mode") == "polymarket_only":
                     self._event(
@@ -913,7 +1042,8 @@ class ShadowEngine:
             order = leg.get("unwind_order")
             if remaining > 1e-9 and order is not None:
                 attempt = await self._attempt(
-                    state, leg, "UNWIND", remaining, order, snapshot, snapshot_ids
+                    state, leg, "UNWIND", remaining, order, snapshot, snapshot_ids,
+                    market=market,
                 )
                 if state.get("live_order_unknown"):
                     return "LIVE ORDER RESULT UNKNOWN; trading locked until the Polymarket account is reconciled"
@@ -941,7 +1071,9 @@ class ShadowEngine:
                 exit_ou_score = None
                 if spread is not None:
                     ou_stats = self.calibration.ou_stats(
-                        bucket, before_market_start=snapshot.start_at.timestamp(),
+                        bucket, before_market_start=(
+                            snapshot.start_at if snapshot is not None else market.start_at
+                        ).timestamp(),
                         window=self.settings.history_window_markets,
                     )
                     if ou_stats.count >= self.settings.min_history_markets:
@@ -966,6 +1098,8 @@ class ShadowEngine:
                         state, "EXIT_RULE", None, side=None, status=status,
                         details={"reason": reason, "ou_score": exit_ou_score,
                                  "exit_threshold": threshold,
+                                 "trigger_source": "paired_ou_signal" if crossed else "max_hold_clock",
+                                 "execution_book_source": "polymarket_only",
                                  "max_hold_seconds": self.settings.max_hold_seconds},
                     )
                     exit_trigger_message = (
@@ -998,7 +1132,8 @@ class ShadowEngine:
                 order = leg.get("exit_order")
                 if remaining > 1e-9 and order is not None:
                     attempt = await self._attempt(
-                        state, leg, "EXIT", remaining, order, snapshot, snapshot_ids
+                        state, leg, "EXIT", remaining, order, snapshot, snapshot_ids,
+                        market=market,
                     )
                     if state.get("live_order_unknown"):
                         return "LIVE ORDER RESULT UNKNOWN; trading locked until the Polymarket account is reconciled"
@@ -1014,6 +1149,11 @@ class ShadowEngine:
                         state["exit_fee"] += fee
                         dirty = True
                         if leg["exit_remaining"] > 1e-9:
+                            if self.live_executor is not None:
+                                await self._prepare_live_sell_order(
+                                    state, leg, market, float(leg["exit_remaining"]),
+                                    order.get("live_tick_size"),
+                                )
                             immediate_live_retry = (
                                 self.live_executor is not None
                                 and (order.get("live_accepted")
@@ -1036,7 +1176,7 @@ class ShadowEngine:
                 )
                 state["net_pnl"] = (float(state["exit_value"]) - float(state["exit_fee"])
                                     - float(state["entry_cost"]) - float(state["entry_fee"]))
-                state["closed_at"] = snapshot.captured_at.isoformat()
+                state["closed_at"] = captured_at.isoformat()
                 self._event(state, "TRADE", None, side=None, status=state["status"],
                             details={"position_shares" if state.get("execution_mode") == "polymarket_only"
                                      else "paired_shares": state["paired_shares"],
@@ -1097,6 +1237,11 @@ class ShadowEngine:
     def _persist(self) -> None:
         if self.active is not None:
             self.store.update_shadow_trade(self.active)
+
+    async def resolve_market_async(self, market: Market, winning_asset_id: str,
+                                   resolved_at: datetime) -> bool:
+        async with self._process_lock:
+            return self.resolve_market(market, winning_asset_id, resolved_at)
 
     def resolve_market(self, market: Market, winning_asset_id: str,
                        resolved_at: datetime) -> bool:
@@ -1224,6 +1369,64 @@ class ShadowEngine:
             elif state.get("hold_due_epoch") is not None:
                 due.append(float(state["hold_due_epoch"]))
         return min(due) if due else None
+
+    def next_live_exit_wakeup_epoch(self) -> float | None:
+        """Return a clock deadline for a live max-hold trigger or a live exit retry."""
+        state = self.active
+        if (
+            self.live_executor is None or state is None
+            or state.get("live_order_unknown") or state.get("live_position_unresolved")
+            or not state.get("entries_resolved")
+            or float(state.get("paired_shares", 0.0)) <= 1e-9
+        ):
+            return None
+        if not state.get("exit_triggered"):
+            due = state.get("max_hold_due_epoch")
+            return None if due is None else float(due)
+        deadlines = [
+            float(leg["exit_order"]["arrival"])
+            for leg in state["legs"]
+            if float(leg.get("exit_remaining", 0.0)) > 1e-9
+            and leg.get("exit_order") is not None
+        ]
+        if not deadlines and any(float(leg.get("exit_remaining", 0.0)) > 1e-9 for leg in state["legs"]):
+            return time.time()
+        return min(deadlines) if deadlines else None
+
+    async def process_live_exit_due(self, market: Market | None) -> str | None:
+        """Advance max-hold and live exit retries from the Polymarket book alone."""
+        if self.live_executor is None:
+            return None
+        async with self._process_lock:
+            state = self.active
+            if (
+                state is None or state.get("live_order_unknown")
+                or state.get("live_position_unresolved")
+                or not state.get("entries_resolved")
+                or float(state.get("paired_shares", 0.0)) <= 1e-9
+            ):
+                return None
+            now = time.time()
+            if not state.get("exit_triggered"):
+                due = state.get("max_hold_due_epoch")
+                if state.get("exit_mode") != "directional_ou_threshold" or due is None or now < float(due):
+                    return None
+            if market is None or market.key != str(state["market_key"]):
+                raw = state.get("resolution_market") or {}
+                try:
+                    market = Market(
+                        venue="polymarket", key=str(raw["key"]), label=str(raw["key"]),
+                        start_at=datetime.fromtimestamp(float(raw["start_at"]), timezone.utc),
+                        end_at=datetime.fromtimestamp(float(raw["end_at"]), timezone.utc),
+                        up_token=str(raw["up_token"]), down_token=str(raw["down_token"]),
+                        condition_id=str(raw["condition_id"]),
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    return None
+            return await self._advance(
+                None, {}, int(state.get("bucket", 0)), None,
+                market=market, captured_at=datetime.now(timezone.utc),
+            )
 
     @staticmethod
     def _delay_summary(state: dict[str, Any]) -> str:

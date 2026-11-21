@@ -5,7 +5,7 @@ import json
 import random
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable
 
 from .config import Settings
@@ -18,6 +18,61 @@ from .live_execution import (
 from .models import Book, Market, PairSnapshot
 from .storage import Store
 from .strategy import RollingCalibration, event_bucket, mid_spread
+
+
+_LIVE_ALERT_POLICIES: dict[str, tuple[str, str, str]] = {
+    "LIVE_ORDER_UNKNOWN": (
+        "order_outcome_unknown", "Polymarket 下單結果不明",
+        "為避免重複下單，該市場後續交易已暫停；請核對錢包訂單與成交，市場到期後新市場會恢復。",
+    ),
+    "LIVE_EXIT_BELOW_MINIMUM": (
+        "position_below_sell_minimum", "持倉低於市場最小賣出量",
+        "目前持倉無法送出有效賣單，系統保留部位到市場結束；請核對錢包持倉。",
+    ),
+    "LIVE_SELL_BALANCE_RETRY": (
+        "sell_balance_allowance_rejected", "賣單被餘額／授權拒絕",
+        "程式會持續重試賣出；請檢查 token 餘額與 allowance。",
+    ),
+    "LIVE_MARKET_VERIFY_FAILED": (
+        "market_verification_failed", "Polymarket 市場／Token 驗證失敗",
+        "此次委託未送出；請檢查市場 condition、token 對應與 SDK metadata。",
+    ),
+    "LIVE_BLOCKED_NON_POLYMARKET": (
+        "non_polymarket_live_order_blocked", "Live 訂單被非 Polymarket 腿安全檢查阻擋",
+        "該交易已進入安全鎖定；請檢查選腿與交易狀態。",
+    ),
+    "LIVE_EXIT_NO_BID": (
+        "exit_book_has_no_bid", "退出簿沒有可用 Bid",
+        "目前無法成交賣出，系統會等後續行情再重試。",
+    ),
+    "LIVE_EXIT_BOOK_UNAVAILABLE": (
+        "exit_book_unavailable", "退出時沒有可用 Polymarket 行情簿",
+        "賣出尚未完成，系統會等行情簿恢復後再重試。",
+    ),
+    "LIVE_EXIT_BOOK_STALE": (
+        "exit_book_stale", "退出用 Polymarket 行情簿已過期",
+        "目前不會用過期報價送賣單，系統會等新行情再重試。",
+    ),
+    "LIVE_ENTRY_SIZE_BLOCKED": (
+        "entry_below_market_minimum", "進場股數低於市場最小下單量",
+        "本次訊號未送出買單；請檢查市場最小量與設定股數。",
+    ),
+    "LIVE_ENTRY_AMOUNT_INVALID": (
+        "entry_amount_invalid", "買入名目金額無效",
+        "本次訊號未送出買單；請檢查 best ask 與下單金額計算。",
+    ),
+}
+
+# These execution outcomes are recorded for audit and settlement, but do not
+# stop future markets or generate Discord risk alerts.
+for _status in (
+    "LIVE_EXIT_BELOW_MINIMUM",
+    "LIVE_SELL_BALANCE_RETRY",
+    "LIVE_EXIT_NO_BID",
+    "LIVE_EXIT_BOOK_UNAVAILABLE",
+    "LIVE_EXIT_BOOK_STALE",
+):
+    _LIVE_ALERT_POLICIES.pop(_status, None)
 
 
 def _iso(epoch: float) -> str:
@@ -44,16 +99,14 @@ def _partial_sweep(book: Book, *, side: str, shares: float, fee_coefficient: flo
     return filled, notional, fee
 
 
-def _live_buy_limit(best_ask: float, slippage: float, tick_size: Decimal) -> Decimal | None:
+def _live_market_buy_amount(requested_shares: float, best_ask: float) -> Decimal | None:
+    """Convert the nominal share target to a cent-rounded FAK market-buy notional."""
+    shares = Decimal(str(requested_shares))
     ask = Decimal(str(best_ask))
-    tick = Decimal(str(tick_size))
-    if not ask.is_finite() or not tick.is_finite() or tick <= 0 or tick >= 1:
+    if not shares.is_finite() or not ask.is_finite() or shares <= 0 or not Decimal("0") < ask < 1:
         return None
-    requested = ask + Decimal(str(slippage))
-    rounded = (requested / tick).to_integral_value(rounding=ROUND_CEILING) * tick
-    legal_cap = (Decimal("0.99") / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
-    limit = min(rounded, legal_cap)
-    return limit if limit >= ask and limit > 0 else None
+    amount = (shares * ask).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return amount if amount > 0 else None
 
 
 class ShadowEngine:
@@ -65,14 +118,26 @@ class ShadowEngine:
         self.settings = settings
         self.run_id = run_id
         self.live_executor = live_executor
+        self._risk_alert_callback: Callable[[dict[str, Any]], None] | None = None
         self.calibration = RollingCalibration(
             store, window=settings.history_window_markets, rv_window=settings.rv_history_window_markets,
             bucket_seconds=settings.bucket_seconds
         )
         now = time.time()
+        open_trades = store.open_shadow_trades()
+        for state in open_trades:
+            if (state.get("trading_mode") == "live"
+                    and (state.get("live_position_unresolved")
+                         or state.get("status") == "UNRESOLVED_LIVE_POSITION")):
+                state["status"] = "SETTLEMENT_PENDING"
+                state.pop("live_position_unresolved", None)
+                state["settlement_pending_reason"] = "remainder_below_minimum_sell_size"
+                state["closed_at"] = datetime.now(timezone.utc).isoformat()
+                store.update_shadow_trade(state)
         self.active: dict[str, Any] | None = next((
-            state for state in store.open_shadow_trades()
+            state for state in open_trades
             if not state.get("live_order_quarantined")
+            and state.get("status") != "SETTLEMENT_PENDING"
             and not (
                 state.get("live_order_unknown")
                 and float(state.get("market_end", float("inf"))) <= now
@@ -86,6 +151,40 @@ class ShadowEngine:
                 raise ValueError("live mode will not resume an open paper/shadow trade")
             if any(leg.get("venue") != "polymarket" for leg in self.active.get("legs", [])):
                 raise ValueError("live mode will not resume a non-Polymarket position")
+
+    def set_risk_alert_callback(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        self._risk_alert_callback = callback
+        if self.live_executor is None or self.active is None:
+            return
+        if self.active.get("live_order_unknown"):
+            self._schedule_live_risk_alert(
+                self.active, "LIVE_ORDER_UNKNOWN",
+                phase=str(self.active.get("live_order_unknown_phase") or "TRADE"),
+            )
+
+    def _schedule_live_risk_alert(
+        self, state: dict[str, Any], status: str, *, phase: str,
+        side: str | None = None,
+    ) -> None:
+        policy = _LIVE_ALERT_POLICIES.get(status)
+        callback = self._risk_alert_callback
+        if policy is None or callback is None:
+            return
+        alert_code, title, action = policy
+        alert = {
+            "dedupe_key": f"{state.get('trade_id', 'unknown')}:{alert_code}:{phase}",
+            "alert_code": alert_code,
+            "title": title,
+            "market_key": state.get("market_key"),
+            "phase": phase,
+            "side": side,
+            "signal": state.get("signal"),
+            "action": action,
+        }
+        try:
+            callback(alert)
+        except Exception as exc:
+            print(f"DISCORD RISK ALERT SCHEDULE ERROR ({type(exc).__name__})", flush=True)
 
     def process(self, snapshot: PairSnapshot, *, evaluate_signals: bool = True) -> str:
         """Synchronous compatibility path for paper callers and the demo."""
@@ -247,7 +346,7 @@ class ShadowEngine:
             "exit=directional-ou-threshold-or-maxhold;"
             f"rvroll={self.settings.rv_history_window_markets};"
             f"rvmin={self.settings.min_rv_history_markets};"
-            f"liveslip={self.settings.live_max_slippage:g};"
+            f"livebuy={'fak-market-no-explicit-max-price' if self.live_executor is not None else 'n/a'};"
 
             f"poly={self.settings.poly_order_network_ms:g}+{self.settings.poly_order_api_ms:g};"
             f"binance={self.settings.binance_order_network_ms:g}+{self.settings.binance_order_api_ms:g};"
@@ -419,6 +518,13 @@ class ShadowEngine:
             "order_arrive_at": None if order is None else order["arrival"],
             "status": status, "details_json": json.dumps(details or {}, separators=(",", ":")),
         })
+        alert_status = status
+        if status == "LIVE_BOOK_STALE" and phase in {"EXIT", "UNWIND"}:
+            alert_status = "LIVE_EXIT_BOOK_STALE"
+        if self.live_executor is not None:
+            self._schedule_live_risk_alert(
+                state, alert_status, phase=phase, side=side,
+            )
 
     async def _attempt(self, state: dict[str, Any], leg: dict[str, Any], phase: str,
                        remaining: float, order: dict[str, Any], snapshot: PairSnapshot | None,
@@ -529,10 +635,6 @@ class ShadowEngine:
                 tick_size = await self.live_executor.verify_market(market)
                 order["live_tick_size"] = str(tick_size)
                 await self.live_executor.prewarm_order_metadata(market)
-                if phase == "ENTRY":
-                    await self.live_executor.prepare_buy_order_pool(
-                        market, shares=remaining, tick_size=tick_size,
-                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -585,6 +687,8 @@ class ShadowEngine:
                             details={"book_age_ms": round(live_book_age * 1000.0, 3),
                                      "max_book_age_ms": self.settings.live_max_book_age_seconds * 1000.0})
                 return 0.0, 0.0, 0.0
+            market_amount_usdc: Decimal | None = None
+            limit_price: Decimal | None = None
             if phase == "ENTRY":
                 min_live_shares = max(5.0, self.settings.min_shares,
                                       float(market.min_order_size))
@@ -609,45 +713,43 @@ class ShadowEngine:
                                 book=book, snapshot_id=snapshot_ids.get((leg["venue"], leg["outcome"])),
                                 order=order, details={"reason": "no visible ask in current memory book"})
                     return 0.0, 0.0, 0.0
-                assert tick_size is not None
-                limit_price = _live_buy_limit(
-                    book.best_ask.price, self.settings.live_max_slippage, tick_size,
-                )
-                if limit_price is None:
-                    return 0.0, 0.0, 0.0
-                estimated_filled, estimated_notional, _ = _partial_sweep(
-                    book, side="BUY", shares=remaining,
-                    fee_coefficient=self.settings.taker_fee_coefficient,
-                    max_price=float(limit_price),
-                )
-                if estimated_filled <= 1e-9:
+                market_amount_usdc = _live_market_buy_amount(remaining, book.best_ask.price)
+                if market_amount_usdc is None:
                     order["live_result_recorded"] = True
                     order["live_result"] = {"filled": 0.0, "notional": 0.0, "fee": 0.0}
-                    order["live_block_reason"] = "no_visible_ask_within_limit"
+                    order["live_block_reason"] = "invalid_market_buy_notional"
                     self._persist()
                     self._event(state, phase, leg, side=side,
-                                status="LIVE_ENTRY_PRICE_BLOCKED",
+                                status="LIVE_ENTRY_AMOUNT_INVALID",
                                 requested=remaining, filled=0.0, notional=0.0, fee=0.0,
-                                book=book, snapshot_id=snapshot_ids.get((leg["venue"], leg["outcome"])),
-                                order=order,
+                                book=book, order=order,
                                 details={"best_ask": book.best_ask.price,
-                                         "limit_price": str(limit_price),
-                                         "estimated_book_fill": estimated_filled,
-                                         "estimated_book_notional": estimated_notional})
+                                         "requested_shares": remaining})
                     return 0.0, 0.0, 0.0
             else:
                 limit_price = Decimal("0.01")
                 min_live_shares = max(5.0, float(market.min_order_size))
                 if remaining + 1e-9 < min_live_shares:
-                    state["live_position_unresolved"] = True
-                    state["status"] = "UNRESOLVED_LIVE_POSITION"
+                    state["status"] = "SETTLEMENT_PENDING"
+                    state.pop("live_position_unresolved", None)
+                    state["settlement_pending_reason"] = "remainder_below_minimum_sell_size"
+                    state["closed_at"] = datetime.now(timezone.utc).isoformat()
                     self._event(state, phase, leg, side=side, status="LIVE_EXIT_BELOW_MINIMUM",
                                 requested=remaining, book=book,
                                 snapshot_id=snapshot_ids.get((leg["venue"], leg["outcome"])),
                                 order=order,
                                 details={"minimum_live_shares": min_live_shares,
-                                         "manual_account_reconciliation_required": True})
+                                         "remaining_shares": remaining,
+                                         "settlement_status": "awaiting Polymarket market resolution",
+                                         "new_trading_allowed": True})
+                    self._event(state, "TRADE", None, side=None, status="SETTLEMENT_PENDING",
+                                details={"remaining_shares": remaining,
+                                         "settlement_status": "awaiting Polymarket market resolution",
+                                         "reason": "remainder_below_minimum_sell_size",
+                                         "new_trading_allowed": True})
                     self._persist()
+                    if self.active is state:
+                        self.active = None
                     return None
                 estimated_filled, estimated_notional, _ = _partial_sweep(
                     book, side="SELL", shares=remaining,
@@ -668,25 +770,36 @@ class ShadowEngine:
                     return 0.0, 0.0, 0.0
             intent_details = {
                 "execution_mode": "live", "order_type": "FAK", "asset_id": leg["token_id"],
-                "requested_shares": remaining, "limit_price": str(limit_price),
-                "post_only": False, "limit_price_basis": (
-                    "best_ask_plus_configured_dollar_offset_capped_at_0.99"
-                    if phase == "ENTRY" else "0.01_marketable_sell_floor"
-                ),
+                "requested_shares": remaining,
+                "post_only": False,
                 "book_received_at": book.received_at.timestamp(),
                 "book_source_at": None if book.source_at is None else book.source_at.timestamp(),
                 "book_age_ms": round(book.age_seconds(now) * 1000.0, 3),
-                "live_max_slippage_usd": self.settings.live_max_slippage if phase == "ENTRY" else None,
                 "tick_size": None if tick_size is None else str(tick_size),
                 "fee_accounting": "configured_fee_formula_applied_to_live_vwap",
             }
+            if phase == "ENTRY":
+                assert market_amount_usdc is not None and book.best_ask is not None
+                intent_details.update({
+                    "market_buy_amount_usdc": format(market_amount_usdc, "f"),
+                    "market_buy_amount_basis": "requested_shares_times_current_memory_best_ask",
+                    "sdk_price_context_source": "fresh_clob_book",
+                    "sdk_explicit_max_price": False,
+                    "nominal_share_target": remaining,
+                    "memory_best_ask": book.best_ask.price,
+                })
+            else:
+                intent_details.update({
+                    "limit_price": str(limit_price),
+                    "limit_price_basis": "0.01_marketable_sell_floor",
+                })
             max_attempts = 2 if phase == "ENTRY" else 1
             for attempt_number in range(1, max_attempts + 1):
                 if attempt_number == 2:
                     book = self._current_book(snapshot, leg)
                     now = datetime.now(timezone.utc)
                     seconds_left = float(state["market_end"]) - now.timestamp()
-                    if (book.best_ask is None
+                    if (book is None or book.best_ask is None
                             or seconds_left <= self.settings.min_market_time_left_seconds
                             or book.age_seconds(now) > self.settings.live_max_book_age_seconds):
                         self._event(
@@ -697,35 +810,26 @@ class ShadowEngine:
                                      "seconds_left": seconds_left},
                         )
                         break
-                    assert tick_size is not None
-                    retry_limit = _live_buy_limit(
-                        book.best_ask.price, self.settings.live_max_slippage, tick_size,
-                    )
-                    retry_filled, retry_notional, _ = _partial_sweep(
-                        book, side="BUY", shares=remaining,
-                        fee_coefficient=self.settings.taker_fee_coefficient,
-                        max_price=None if retry_limit is None else float(retry_limit),
-                    )
-                    if retry_limit is None or retry_filled <= 1e-9:
+                    retry_amount = _live_market_buy_amount(remaining, book.best_ask.price)
+                    if retry_amount is None:
                         self._event(
                             state, phase, leg, side=side, status="LIVE_BUY_RETRY_SKIPPED",
                             requested=remaining, book=book, order=order,
                             details={**intent_details, "retry_count": 0,
-                                     "reason": "no visible ask within refreshed limit",
-                                     "best_ask": book.best_ask.price,
-                                     "retry_limit_price": None if retry_limit is None else str(retry_limit),
-                                     "estimated_book_fill": retry_filled,
-                                     "estimated_book_notional": retry_notional},
+                                     "reason": "invalid refreshed best ask for market-buy notional",
+                                     "best_ask": book.best_ask.price},
                         )
                         break
-                    limit_price = retry_limit
+                    prior_market_amount = market_amount_usdc
+                    market_amount_usdc = retry_amount
                     intent_details = {
                         **intent_details,
-                        "limit_price": str(limit_price),
+                        "market_buy_amount_usdc": format(market_amount_usdc, "f"),
+                        "memory_best_ask": book.best_ask.price,
                         "book_received_at": book.received_at.timestamp(),
                         "book_source_at": None if book.source_at is None else book.source_at.timestamp(),
                         "book_age_ms": round(book.age_seconds(now) * 1000.0, 3),
-                        "retry_of_limit_price": str(intent_details["limit_price"]),
+                        "retry_of_market_buy_amount_usdc": format(prior_market_amount, "f"),
                         "attempt_number": 2,
                         "retry_reason": "explicit_fak_no_fill",
                     }
@@ -773,9 +877,11 @@ class ShadowEngine:
 
                 try:
                     if phase == "ENTRY":
+                        assert market_amount_usdc is not None
                         accepted, fill, response_details = await self.live_executor.buy_fak(
                             asset_id=leg["token_id"], requested_qty=remaining,
-                            limit_price=limit_price, on_order_signed=record_signed_order,
+                            market_amount_usdc=market_amount_usdc,
+                            on_order_signed=record_signed_order,
                             timing_context=timing_context,
                         )
                     else:
@@ -988,9 +1094,6 @@ class ShadowEngine:
             self.active = None
             return f"{self._status_prefix} UNRESOLVED: market ended with open/pending exposure; settlement not assumed"
 
-        if state.get("live_position_unresolved"):
-            return "LIVE POSITION HELD UNTIL MARKET END; new entries resume on the next market"
-
         for leg in state["legs"]:
             if leg["entry_attempted"]:
                 continue
@@ -1001,8 +1104,6 @@ class ShadowEngine:
             )
             if state.get("live_order_unknown"):
                 return "LIVE ORDER RESULT UNKNOWN; trading locked until the Polymarket account is reconciled"
-            if state.get("live_position_unresolved"):
-                return "LIVE POSITION UNRESOLVED; trading locked pending account reconciliation"
             if attempt is not None:
                 filled, notional, fee = attempt
                 leg["entry_attempted"] = True
@@ -1073,8 +1174,9 @@ class ShadowEngine:
                 )
                 if state.get("live_order_unknown"):
                     return "LIVE ORDER RESULT UNKNOWN; trading locked until the Polymarket account is reconciled"
-                if state.get("live_position_unresolved"):
-                    return "LIVE POSITION UNRESOLVED; trading locked pending account reconciliation"
+                if state.get("status") == "SETTLEMENT_PENDING":
+                    return ("LIVE SETTLEMENT PENDING; below-minimum remainder retained for market resolution; "
+                            "new trading continues")
                 if attempt is not None:
                     filled, proceeds, fee = attempt
                     leg["unwind_remaining"] = max(0.0, remaining - filled)
@@ -1163,8 +1265,9 @@ class ShadowEngine:
                     )
                     if state.get("live_order_unknown"):
                         return "LIVE ORDER RESULT UNKNOWN; trading locked until the Polymarket account is reconciled"
-                    if state.get("live_position_unresolved"):
-                        return "LIVE POSITION UNRESOLVED; trading locked pending account reconciliation"
+                    if state.get("status") == "SETTLEMENT_PENDING":
+                        return ("LIVE SETTLEMENT PENDING; below-minimum remainder retained for market resolution; "
+                                "new trading continues")
                     if attempt is not None:
                         filled, proceeds, fee = attempt
                         leg["exit_remaining"] = max(0.0, remaining - filled)
@@ -1375,12 +1478,9 @@ class ShadowEngine:
         if self.active is None:
             return None
         state = self.active
-        # An unresolved live order/position cannot be advanced by replaying its
-        # stale order deadline. Let the feed loop keep receiving fresh markets
-        # so a later market boundary or account reconciliation can unlock it.
-        if self.live_executor is not None and (
-            state.get("live_order_unknown") or state.get("live_position_unresolved")
-        ):
+        # An unresolved live order cannot be advanced by replaying its stale
+        # order deadline; keep receiving fresh market updates for later handling.
+        if self.live_executor is not None and state.get("live_order_unknown"):
             return None
         due: list[float] = []
         for leg in state["legs"]:
@@ -1408,7 +1508,7 @@ class ShadowEngine:
         state = self.active
         if (
             self.live_executor is None or state is None
-            or state.get("live_order_unknown") or state.get("live_position_unresolved")
+            or state.get("live_order_unknown")
             or not state.get("entries_resolved")
             or float(state.get("paired_shares", 0.0)) <= 1e-9
         ):
@@ -1434,7 +1534,6 @@ class ShadowEngine:
             state = self.active
             if (
                 state is None or state.get("live_order_unknown")
-                or state.get("live_position_unresolved")
                 or not state.get("entries_resolved")
                 or float(state.get("paired_shares", 0.0)) <= 1e-9
             ):

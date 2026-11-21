@@ -8,7 +8,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 import httpx
@@ -155,15 +155,28 @@ class _FeedErrorLogger:
     def __init__(self) -> None:
         self.last_key: str | None = None
         self.last_logged_at = 0.0
+        self.alert_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def set_alert_callback(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        self.alert_callback = callback
 
     def report(self, exc: Exception) -> None:
         now = time.monotonic()
         safe_message = _FEED_ERROR_URL_QUERY_RE.sub(r"\1?[query redacted]", str(exc))
         key = f"{type(exc).__name__}: {safe_message}"
+        first_error_in_incident = self.last_key is None
         if key != self.last_key or now - self.last_logged_at >= LIVE_STATUS_LOG_INTERVAL_SECONDS:
             print(f"FEED ERROR ({type(exc).__name__}): {safe_message}; retrying", flush=True)
             self.last_key = key
             self.last_logged_at = now
+        if first_error_in_incident and self.alert_callback is not None:
+            self.alert_callback({
+                "dedupe_key": f"market-feed-outage:{time.time_ns()}",
+                "alert_code": "market_execution_loop_error",
+                "title": "行情／交易主迴圈發生錯誤",
+                "reason": type(exc).__name__,
+                "action": "新訊號處理可能暫停；程式會等待後重試，行情恢復後自動繼續。",
+            })
 
     def recovered(self) -> None:
         if self.last_key is not None:
@@ -239,7 +252,10 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
             "max_quote_age_seconds": settings.max_quote_age_seconds,
             "order_delay_ms": {"polymarket": 0 if execution_mode == "live" else
                                 settings.poly_order_network_ms + settings.poly_order_api_ms},
-            "live_max_slippage": settings.live_max_slippage if execution_mode == "live" else None,
+            "live_buy_order_type": (
+                "FAK market; amount based on memory best ask; no explicit max_price"
+                if execution_mode == "live" else None
+            ),
             "live_max_book_age_seconds": settings.live_max_book_age_seconds if execution_mode == "live" else None,
             "live_retry_interval_seconds": settings.live_retry_interval_seconds if execution_mode == "live" else None,
             "resolution_grace_seconds": settings.resolution_grace_seconds if execution_mode == "live" else None,
@@ -263,12 +279,10 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
         try:
             tick_size = await live_executor.verify_market(market)
             metadata = await live_executor.prewarm_order_metadata(market)
-            buy_pool = await live_executor.prepare_buy_order_pool(
-                market, shares=settings.min_shares, tick_size=tick_size,
-            )
             details = {
                 "condition_id": market.condition_id, "tick_size": str(tick_size),
-                "sdk_metadata_prewarm": metadata, "buy_order_pool": buy_pool,
+                "sdk_metadata_prewarm": metadata,
+                "buy_order_prepare": "FAK market order signed from fresh SDK CLOB book at signal time",
                 "recovered_sell_order_pools": await engine.prepare_open_live_sell_orders(
                     market, tick_size,
                 ),
@@ -311,9 +325,9 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
     feed_error_logger = _FeedErrorLogger()
     if execution_mode == "live":
         print("LIVE REAL ORDERS | Polymarket single-leg FAK orders are enabled; Binance supplies signal data only.")
-        print(f"Live execution: FAK submit; BUY price cap is best ask + ${settings.live_max_slippage:.2f}; "
-              f"no per-order USDC cap; max book age={settings.live_max_book_age_seconds:g}s; "
-              f"sell FAK floor=$0.01; ledger={db_path}.")
+        print(f"Live execution: BUY FAK market order, no explicit max_price; USDC amount ≈ "
+              f"target shares × memory best ask, fees on top; max memory-book age="
+              f"{settings.live_max_book_age_seconds:g}s; SELL FAK floor=$0.01; ledger={db_path}.")
     else:
         print("SHADOW MODE ONLY | Polymarket single-leg paper positions; Binance supplies signal data only; no real orders are sent.")
     print(f"rolling={settings.history_window_markets} completed markets, "
@@ -382,12 +396,22 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                 settings.discord_webhook_url,
                 settings.discord_pnl_interval_seconds,
                 trading_mode=execution_mode,
+                mention_user_id=settings.discord_mention_user_id,
                 collateral_balance_provider=(
                     None if live_executor is None else live_executor.get_collateral_balance
                 ),
             )
+            if execution_mode == "live":
+                engine.set_risk_alert_callback(notifier.schedule_alert)
+                feed_error_logger.set_alert_callback(notifier.schedule_alert)
             notifier_task = asyncio.create_task(notifier.run(), name="discord-pnl-notifier")
-            print(f"Discord PnL notifications enabled; interval={settings.discord_pnl_interval_seconds}s.")
+            if execution_mode == "live":
+                print(f"Discord notifications enabled; PnL interval={settings.discord_pnl_interval_seconds}s; "
+                      "live risk alerts mention the configured user ID.")
+            else:
+                print(f"Discord PnL notifications enabled; interval={settings.discord_pnl_interval_seconds}s.")
+        elif execution_mode == "live":
+            print("Discord risk alerts are disabled because PAIR_DISCORD_WEBHOOK_URL is unset.")
         while True:
             now = time.monotonic()
             if duration > 0 and now - start >= duration:
@@ -610,7 +634,9 @@ def main() -> None:
             else:
                 print("Closed/settled net PnL / win rate: n/a")
             if execution_mode == "live":
-                print("Live execution uses current in-memory books immediately and sends FAK orders; "
+                print("Live BUYs use a notional derived from the current memory best ask; the SDK reads "
+                      "a fresh CLOB book to derive its signed market-order price context. "
+                      "SELLs remain FAK orders; "
                       "unresolved API outcomes require account reconciliation.")
             else:
                 print("Simulated order delay: fixed "

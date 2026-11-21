@@ -26,7 +26,7 @@ class Settings:
     hold_seconds: int = 20
     min_market_time_left_seconds: int = 60
     max_hold_seconds: int = 60
-    min_shares: float = 5.0
+    min_shares: float = 6.0
     taker_fee_coefficient: float = 0.07
     # Fixed 330ms total assumed delay; keep the legacy components for stored scenarios.
     poly_order_network_ms: float = 330.0
@@ -36,11 +36,11 @@ class Settings:
     order_latency_jitter_ms: float = 0.0
     trading_mode: str = "paper"
     live_db_path: Path = Path("data/live_pair_trading.sqlite3")
-    live_max_slippage: float = 0.15
     live_max_book_age_seconds: float = 2.0
     live_retry_interval_seconds: float = 1.0
     resolution_grace_seconds: float = 900.0
     discord_webhook_url: str = ""
+    discord_mention_user_id: str = "1560213041126187019"
     discord_pnl_interval_seconds: int = 900
     db_path: Path = Path("data/pair_trading.sqlite3")
 
@@ -69,7 +69,7 @@ class Settings:
                 60, _int_env("PAIR_MIN_MARKET_TIME_LEFT_SECONDS", 60, minimum=1)
             ),
             max_hold_seconds=_int_env("PAIR_MAX_HOLD_SECONDS", 60, minimum=1),
-            min_shares=_float_env("PAIR_MIN_SHARES", 5.0, minimum=1.0),
+            min_shares=_float_env("PAIR_MIN_SHARES", 6.0, minimum=1.0),
             taker_fee_coefficient=_float_env("PAIR_TAKER_FEE_COEFFICIENT", 0.07, minimum=0.0),
             poly_order_network_ms=_float_env("PAIR_POLY_ORDER_NETWORK_MS", 330.0, minimum=0.0),
             poly_order_api_ms=_float_env("PAIR_POLY_ORDER_API_MS", 0.0, minimum=0.0),
@@ -80,7 +80,6 @@ class Settings:
             live_db_path=Path(os.getenv(
                 "PAIR_LIVE_DB_PATH", str(default_db.with_name("live_pair_trading.sqlite3"))
             )),
-            live_max_slippage=_float_env("PAIR_LIVE_MAX_SLIPPAGE", 0.15, minimum=0.0),
             live_max_book_age_seconds=_float_env("PAIR_LIVE_MAX_BOOK_AGE_SECONDS", 2.0, minimum=0.1),
             live_retry_interval_seconds=_float_env(
                 "PAIR_LIVE_RETRY_INTERVAL_SECONDS", 1.0, minimum=0.1
@@ -89,6 +88,10 @@ class Settings:
                 "PAIR_RESOLUTION_GRACE_SECONDS", 900.0, minimum=0.0
             ),
             discord_webhook_url=os.getenv("PAIR_DISCORD_WEBHOOK_URL", "").strip(),
+            discord_mention_user_id=(
+                os.getenv("PAIR_DISCORD_MENTION_USER_ID", "1560213041126187019").strip()
+                or "1560213041126187019"
+            ),
             discord_pnl_interval_seconds=_int_env(
                 "PAIR_DISCORD_PNL_INTERVAL_SECONDS", 900, minimum=60
             ),
@@ -102,8 +105,8 @@ class Settings:
             raise ValueError("PAIR_MIN_RV_HISTORY_MARKETS cannot exceed PAIR_RV_HISTORY_WINDOW_MARKETS")
         if settings.ou_exit_threshold >= settings.ou_entry_threshold:
             raise ValueError("PAIR_OU_EXIT_THRESHOLD must be below PAIR_OU_ENTRY_THRESHOLD")
-        if settings.live_max_slippage >= 0.99:
-            raise ValueError("PAIR_LIVE_MAX_SLIPPAGE must be below 0.99")
+        if not settings.discord_mention_user_id.isdigit():
+            raise ValueError("PAIR_DISCORD_MENTION_USER_ID must contain only digits")
         if settings.live_db_path.resolve() == settings.db_path.resolve():
             raise ValueError("PAIR_LIVE_DB_PATH must be separate from PAIR_DB_PATH")
         return settings

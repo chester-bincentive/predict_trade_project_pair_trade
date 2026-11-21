@@ -359,7 +359,7 @@ class Store:
                 continue
             for name in (
                 "trigger_to_post_start_ms", "intent_to_post_start_ms", "order_create_ms",
-                "sdk_post_order_call_ms", "post_http_total_ms",
+                "sdk_post_order_call_ms", "post_http_total_ms", "market_book_http_total_ms",
             ):
                 value = timing.get(name)
                 try:

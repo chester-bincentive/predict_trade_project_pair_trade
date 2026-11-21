@@ -37,7 +37,7 @@ Copy-Item .env.example .env
 .venv\Scripts\python.exe run.py live --execution-mode live
 ```
 
-Discord 損益推送是選用功能：在 Discord 目標伺服器的「伺服器設定 → 整合 → Webhooks」建立 incoming webhook，選擇要接收訊息的頻道，再複製 webhook URL 到 `.env` 的 `PAIR_DISCORD_WEBHOOK_URL`。程式啟動後會立即推送摘要，再依 `PAIR_DISCORD_PNL_INTERVAL_SECONDS` 定期推送；預設每 900 秒（15 分鐘），最短可設 60 秒。摘要包含本次啟動後新增的已實現損益、資料庫累計損益、完成筆數、勝率、未平倉和未解決筆數。Webhook 欄位留白就不推送。Webhook URL 等同密碼，請勿分享或提交 `.env`；`.gitignore` 已排除 `.env`。
+Discord 通知是選用功能：在 Discord 目標伺服器的「伺服器設定 → 整合 → Webhooks」建立 incoming webhook，選擇接收頻道，並把 webhook URL 設為 `.env` 的 `PAIR_DISCORD_WEBHOOK_URL`。損益摘要依 `PAIR_DISCORD_PNL_INTERVAL_SECONDS` 定期推送；預設每 900 秒（15 分鐘），最短 60 秒。有效的 Live 交易鎖、無法驗證市場及行情／交易主迴圈錯誤會另行立即告警，並 mention `PAIR_DISCORD_MENTION_USER_ID` 指定的使用者；低於最小賣出量、賣出餘額／授權拒單及退出行情暫時不可用會記錄並按既有流程處理，不會另行提醒。告警只允許 mention 指定使用者，不會解析 `@everyone` 或角色。Webhook 欄位留白時不會推送任何 Discord 通知。Webhook URL 等同密碼，請勿分享或提交 `.env`；`.gitignore` 已排除 `.env`。
 
 `python run.py live --duration-seconds 120` 會跑兩分鐘。預設資料庫為 `data/pair_trading.sqlite3`。`python run.py history-status` 查看校準進度；`python run.py report` 查看 paper/shadow 單腿成交率與損益。
 
@@ -49,7 +49,7 @@ Discord 損益推送是選用功能：在 Discord 目標伺服器的「伺服器
 
 未設定模式時，程式仍以 paper/shadow 執行；`.env.example` 已設為 `PAIR_TRADING_MODE=live`，因此複製後會選擇真實下單模式。Live 使用 `polymarket-client==0.18.0`，私鑰由 `CREDSTORE_REGION` 與 `CREDSTORE_SECRET_NAME` 指定的 credstore 讀取，或直接填 `POLYMARKET_PRIVATE_KEY`。另外必須提供 `POLYMARKET_RELAYER_API_KEY` 與 `POLYMARKET_RELAYER_API_KEY_ADDRESS`。EOA 可不填 wallet address；proxy/smart-wallet 要填 `POLYMARKET_WALLET_ADDRESS`。範例中的憑證欄位保持空白，需自行填入有效值；沒有有效憑證時不能送單。要跑 paper/shadow，請把 `PAIR_TRADING_MODE` 改為 `paper`。
 
-Live 會先驗證 Gamma condition ID 與登入後 CLOB 的 UP/DOWN token 是否一致，並在進入訊號區前預熱 SDK 訂單 metadata、預簽可用的 BUY 限價單。買入使用 exact-share 限價 FAK，數量是策略要求的 shares；限價為送單當下最新記憶體 best ask 加 `PAIR_LIVE_MAX_SLIPPAGE`（預設 $0.15），按 tick size 對齊且最高 $0.99。沒有每筆 USDC 預算上限。明確 FAK 未撮合時，程式讀取最新記憶體簿重新計價並最多重試一次；逾時、取消或回覆不完整則標為未知，不會自動重送。
+Live 會先驗證 Gamma condition ID 與登入後 CLOB 的 UP/DOWN token 是否一致，並在進入訊號區前預熱 SDK 訂單 metadata、驗證與連線；CLOB book-read 與 order-post 的 HTTP/2 連線都會定期暖機。買入使用 FAK market order，USDC 金額按「策略要求 shares × 當下記憶體 best ask」四捨五入到美分；這是名目股數換算的預算，不保證精確成交股數，實際成交以回報為準。程式不傳 `max_price`；SDK 會在簽名前讀取新的 CLOB `/book`，依當時深度產生簽名訂單所需的價格上下文，因此該讀取與簽名耗時會記錄在訂單事件中。買入金額不含手續費，費用另計。明確 FAK 未撮合時，程式讀取最新記憶體簿重新換算 USDC 金額並最多重試一次；逾時、取消或回覆不完整則標為未知，不會自動重送。
 
 賣出使用 exact-share FAK，限價設為 $0.01，讓可成交的剩餘持倉盡量立即賣出；FAK 明確未成交或部分成交時，立即用最新記憶體簿重送剩餘股數，不等冷卻時間或下一筆 WebSocket 更新。若目前沒有可用 bid、報價過期或市場驗證失敗，則等可用簿更新後再送。委託前會檢查簿的更新年齡（`PAIR_LIVE_MAX_BOOK_AGE_SECONDS`，預設 2 秒）與市場最後 60 秒限制。每次 intent 會先寫入資料庫，再呼叫 CLOB；簽名、SDK POST、HTTP 回應和回報耗時也會寫入交易事件。
 

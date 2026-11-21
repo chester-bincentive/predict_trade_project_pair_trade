@@ -21,6 +21,7 @@ _ACTIVE_ORDER_TRACE: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 _ORDER_HTTP_ATTEMPT_EXTENSION = "paper_btc_live_order_http_attempt"
 _METADATA_HTTP_ATTEMPT_EXTENSION = "paper_btc_live_metadata_http_attempt"
+_MARKET_BOOK_HTTP_ATTEMPT_EXTENSION = "paper_btc_live_market_book_http_attempt"
 _HTTPCORE_TRACE_EVENT_PREFIXES = (
     "connection.connect_tcp.",
     "connection.start_tls.",
@@ -276,28 +277,30 @@ class PolymarketLiveExecutor:
         )
 
     async def _keep_order_http_connection_alive(self) -> None:
-        """Reuse the SDK's order transport for a small background keep-alive GET."""
+        """Keep both SDK CLOB HTTP/2 transports warm for book reads and order posts."""
         while self.client is not None:
-            try:
-                context = getattr(self.client, "_ctx", None)
-                transport = getattr(context, "secure_clob", None)
-                get_json = getattr(transport, "get_json", None)
-                if not callable(get_json):
-                    raise RuntimeError("SDK secure CLOB transport has no get_json method")
-                await get_json("/time")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                now = time.monotonic()
-                if (
-                    now - self._last_keepalive_warning_monotonic
-                    >= self._HTTP_KEEPALIVE_WARNING_INTERVAL_SECONDS
-                ):
-                    logger.warning(
-                        "LIVE_ORDER_HTTP_KEEPALIVE_FAILED error_type=%s",
-                        type(exc).__name__,
-                    )
-                    self._last_keepalive_warning_monotonic = now
+            context = getattr(self.client, "_ctx", None)
+            for service_name in ("clob", "secure_clob"):
+                try:
+                    transport = getattr(context, service_name, None)
+                    get_json = getattr(transport, "get_json", None)
+                    if not callable(get_json):
+                        raise RuntimeError(f"SDK {service_name} transport has no get_json method")
+                    await get_json("/time")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    now = time.monotonic()
+                    if (
+                        now - self._last_keepalive_warning_monotonic
+                        >= self._HTTP_KEEPALIVE_WARNING_INTERVAL_SECONDS
+                    ):
+                        logger.warning(
+                            "LIVE_ORDER_HTTP_KEEPALIVE_FAILED service=%s error_type=%s",
+                            service_name,
+                            type(exc).__name__,
+                        )
+                        self._last_keepalive_warning_monotonic = now
             await asyncio.sleep(self._HTTP_KEEPALIVE_INTERVAL_SECONDS)
 
     @staticmethod
@@ -581,6 +584,18 @@ class PolymarketLiveExecutor:
             PolymarketLiveExecutor._export_order_timing(trace)
             return
 
+        if method == "GET" and path.rstrip("/") == "/book" and trace.get("phase") == "order":
+            attempt = {
+                "service": service,
+                "path": path,
+                "request_started_ns": time.time_ns(),
+                "_started_perf_ns": time.perf_counter_ns(),
+            }
+            trace.setdefault("market_book_http_attempts", []).append(attempt)
+            request.extensions[_MARKET_BOOK_HTTP_ATTEMPT_EXTENSION] = attempt
+            PolymarketLiveExecutor._export_order_timing(trace)
+            return
+
         if method == "GET" and (
             path.startswith("/markets-by-token/") or path.startswith("/clob-markets/")
         ):
@@ -616,6 +631,20 @@ class PolymarketLiveExecutor:
             )
             PolymarketLiveExecutor._attach_httpcore_timing(attempt)
             trace["post_response_perf_ns"] = now_perf_ns
+            PolymarketLiveExecutor._export_order_timing(trace)
+            return
+        attempt = request.extensions.get(_MARKET_BOOK_HTTP_ATTEMPT_EXTENSION)
+        if isinstance(attempt, dict):
+            attempt.update(
+                {
+                    "service": service,
+                    "path": str(getattr(getattr(request, "url", None), "path", "")),
+                    "response_received_ns": now_ns,
+                    "elapsed_ms": (now_perf_ns - attempt["_started_perf_ns"]) / 1_000_000.0,
+                    "status_code": getattr(response, "status_code", None),
+                    "http_version": getattr(response, "http_version", None),
+                }
+            )
             PolymarketLiveExecutor._export_order_timing(trace)
             return
         attempt = request.extensions.get(_METADATA_HTTP_ATTEMPT_EXTENSION)
@@ -714,7 +743,7 @@ class PolymarketLiveExecutor:
     @staticmethod
     def _finish_incomplete_http_attempts(trace: dict[str, Any]) -> None:
         now_perf_ns = time.perf_counter_ns()
-        for key in ("post_http_attempts", "metadata_http_attempts"):
+        for key in ("post_http_attempts", "metadata_http_attempts", "market_book_http_attempts"):
             for attempt in trace.get(key, []):
                 if "elapsed_ms" not in attempt:
                     attempt["elapsed_ms"] = (
@@ -729,8 +758,12 @@ class PolymarketLiveExecutor:
         if not isinstance(target, dict):
             return
         attempts = trace.get("post_http_attempts", [])
+        market_book_attempts = trace.get("market_book_http_attempts", [])
         completed = [attempt for attempt in attempts if "response_received_ns" in attempt]
         measured = [attempt for attempt in attempts if "elapsed_ms" in attempt]
+        completed_market_books = [
+            attempt for attempt in market_book_attempts if "response_received_ns" in attempt
+        ]
         last_response = completed[-1] if completed else {}
         target.update(
             {
@@ -766,6 +799,23 @@ class PolymarketLiveExecutor:
                     else None
                 ),
                 "post_http_wait_ms": sum(float(item["elapsed_ms"]) for item in measured),
+                "market_book_http_request_count": len(market_book_attempts),
+                "market_book_http_requests": [
+                    {
+                        key: attempt[key]
+                        for key in (
+                            "service", "path", "request_started_ns", "response_received_ns",
+                            "elapsed_ms", "status_code", "http_version",
+                        )
+                        if key in attempt
+                    }
+                    for attempt in market_book_attempts
+                ],
+                "market_book_http_total_ms": (
+                    sum(float(item["elapsed_ms"]) for item in completed_market_books)
+                    if completed_market_books
+                    else None
+                ),
                 "post_http_status_code": last_response.get("status_code"),
                 "post_http_version": last_response.get("http_version"),
                 "post_request_started_ns": attempts[0].get("request_started_ns") if attempts else None,
@@ -967,7 +1017,7 @@ class PolymarketLiveExecutor:
         *,
         asset_id: str,
         requested_qty: float,
-        limit_price: Decimal | str | float,
+        market_amount_usdc: Decimal | str | float,
         on_order_signed: Callable[[dict[str, Any]], None] | None = None,
         timing_context: dict[str, Any] | None = None,
     ) -> tuple[bool, Fill | None, dict[str, Any]]:
@@ -975,8 +1025,7 @@ class PolymarketLiveExecutor:
             side="BUY",
             asset_id=asset_id,
             requested_qty=requested_qty,
-            shares=requested_qty,
-            limit_price=limit_price,
+            market_amount_usdc=market_amount_usdc,
             on_order_signed=on_order_signed,
             timing_context=timing_context,
         )
@@ -1008,48 +1057,68 @@ class PolymarketLiveExecutor:
         side: str,
         asset_id: str,
         requested_qty: float,
-        shares: float,
-        limit_price: Decimal | str | float,
+        shares: float | None = None,
+        market_amount_usdc: Decimal | str | float | None = None,
+        limit_price: Decimal | str | float | None = None,
         tick_size: Decimal | str | None = None,
         on_order_signed: Callable[[dict[str, Any]], None] | None = None,
         timing_context: dict[str, Any] | None = None,
     ) -> tuple[bool, Fill | None, dict[str, Any]]:
         if self.client is None:
             raise RuntimeError("Polymarket account is not connected")
-        limit_price_decimal = Decimal(str(limit_price))
-        if not limit_price_decimal.is_finite() or not Decimal("0") < limit_price_decimal < Decimal("1"):
-            raise ValueError("FAK limit price must be between 0 and 1")
+        is_buy = side.upper() == "BUY"
+        market_amount_decimal: Decimal | None = None
+        limit_price_decimal: Decimal | None = None
+        if is_buy:
+            if market_amount_usdc is None:
+                raise ValueError("market_amount_usdc is required for BUY market FAK orders")
+            market_amount_decimal = Decimal(str(market_amount_usdc))
+            if not market_amount_decimal.is_finite() or market_amount_decimal <= 0:
+                raise ValueError("BUY market FAK amount must be a positive USDC amount")
+        else:
+            if shares is None or limit_price is None:
+                raise ValueError("shares and limit_price are required for SELL FAK orders")
+            limit_price_decimal = Decimal(str(limit_price))
+            if not limit_price_decimal.is_finite() or not Decimal("0") < limit_price_decimal < Decimal("1"):
+                raise ValueError("FAK limit price must be between 0 and 1")
         trace: dict[str, Any] = {
             "phase": "order",
             "post_http_attempts": [],
             "metadata_http_attempts": [],
+            "market_book_http_attempts": [],
             "export_target": timing_context,
         }
         token: Token[dict[str, Any] | None] = _ACTIVE_ORDER_TRACE.set(trace)
         order_create_started_ns = time.perf_counter_ns()
         try:
-            size_text = f"{shares:.6f}"
-            args: dict[str, Any] = {
-                "asset_id": asset_id,
-                "side": side,
-                "price": format(limit_price_decimal, "f"),
-                "size": size_text,
-                "post_only": False,
-            }
-            fak_order = (
-                self._take_prepared_buy_order(asset_id, size_text, limit_price_decimal)
-                if side.upper() == "BUY"
-                else self._take_prepared_sell_order(
+            if is_buy:
+                # No max_price is passed. The SDK fetches the current CLOB book,
+                # derives its market-order price context, and signs a FAK order.
+                fak_order = await self.client.create_market_order(
+                    asset_id=asset_id,
+                    side="BUY",
+                    amount=format(market_amount_decimal, "f"),
+                    order_type="FAK",
+                )
+                order_prepare_source = "fresh_market_book_estimate_then_sign"
+            else:
+                size_text = f"{shares:.6f}"
+                fak_order = self._take_prepared_sell_order(
                     asset_id, size_text, limit_price_decimal,
                     None if tick_size is None else Decimal(str(tick_size)),
                 )
-            )
-            if fak_order is not None:
-                order_prepare_source = "pre_signed_pool"
-            else:
-                signed_order = await self.client.create_limit_order(**args)
-                fak_order = replace(signed_order, order_type="FAK")
-                order_prepare_source = "on_demand_sign"
+                if fak_order is not None:
+                    order_prepare_source = "pre_signed_pool"
+                else:
+                    signed_order = await self.client.create_limit_order(
+                        asset_id=asset_id,
+                        side="SELL",
+                        price=format(limit_price_decimal, "f"),
+                        size=size_text,
+                        post_only=False,
+                    )
+                    fak_order = replace(signed_order, order_type="FAK")
+                    order_prepare_source = "on_demand_sign"
             trace["order_prepare_source"] = order_prepare_source
             if timing_context is not None:
                 timing_context["order_prepare_source"] = order_prepare_source
@@ -1069,8 +1138,14 @@ class PolymarketLiveExecutor:
             diagnostics = _request_rejection_diagnostics(exc)
             diagnostics.update(
                 {
-                    "sdk_order_stage": "create_limit_order",
-                    "sdk_limit_price": format(limit_price_decimal, "f"),
+                    "sdk_order_stage": "create_market_order" if is_buy else "create_limit_order",
+                    "sdk_market_amount_usdc": (
+                        format(market_amount_decimal, "f") if is_buy else None
+                    ),
+                    "sdk_explicit_max_price": None,
+                    "sdk_limit_price": (
+                        None if is_buy else format(limit_price_decimal, "f")
+                    ),
                     "sdk_error_type": type(exc).__name__,
                     "sdk_error_message": _safe_diagnostic_text(exc),
                     "outcome_unknown": False,
@@ -1092,7 +1167,14 @@ class PolymarketLiveExecutor:
             {
                 "sdk_order_type": "FAK",
                 "sdk_post_only": False,
-                "sdk_limit_price": format(limit_price_decimal, "f"),
+                "sdk_explicit_max_price": None,
+                "sdk_limit_price": None if is_buy else format(limit_price_decimal, "f"),
+                "sdk_market_amount_usdc": (
+                    format(market_amount_decimal, "f") if is_buy else None
+                ),
+                "sdk_market_price_source": (
+                    "fresh_sdk_clob_book_market_order" if is_buy else None
+                ),
                 "sdk_order_prepare_source": trace.get("order_prepare_source", "on_demand_sign"),
             }
         )

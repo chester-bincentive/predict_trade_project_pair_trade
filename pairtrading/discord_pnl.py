@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -21,14 +21,18 @@ class DiscordPnLNotifier:
         *,
         trading_mode: str = "paper",
         collateral_balance_provider: Callable[[], Awaitable[Decimal]] | None = None,
+        mention_user_id: str = "",
     ) -> None:
         self.store = store
         self.webhook_url = webhook_url
         self.interval_seconds = interval_seconds
         self.trading_mode = trading_mode
         self.collateral_balance_provider = collateral_balance_provider
+        self.mention_user_id = str(mention_user_id).strip()
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
         self.baseline = self._stats()
+        self._alert_tasks: set[asyncio.Task[None]] = set()
+        self._sent_alert_keys: set[str] = set()
 
     async def run(self) -> None:
         while True:
@@ -42,7 +46,54 @@ class DiscordPnLNotifier:
             await asyncio.sleep(self.interval_seconds)
 
     async def close(self) -> None:
+        if self._alert_tasks:
+            await asyncio.gather(*self._alert_tasks, return_exceptions=True)
         await self.client.aclose()
+
+    def schedule_alert(self, alert: dict[str, Any]) -> None:
+        """Send a non-blocking, deduplicated alert and ping only the configured user."""
+        dedupe_key = str(alert.get("dedupe_key") or "").strip()
+        if dedupe_key and dedupe_key in self._sent_alert_keys:
+            return
+        if dedupe_key:
+            self._sent_alert_keys.add(dedupe_key)
+        task = asyncio.create_task(self._post_alert(alert), name="discord-live-risk-alert")
+        self._alert_tasks.add(task)
+        task.add_done_callback(self._alert_tasks.discard)
+
+    async def _post_alert(self, alert: dict[str, Any]) -> None:
+        user_id = self.mention_user_id if self.mention_user_id.isdigit() else ""
+        mention = f"<@{user_id}> " if user_id else ""
+        lines = [
+            f"{mention}**⚠️ Live 交易／行情風險提醒**",
+            f"狀況：{str(alert.get('title') or '交易暫停')[:180]}",
+        ]
+        for label, key in (
+            ("市場", "market_key"), ("階段", "phase"), ("方向", "side"), ("策略訊號", "signal"),
+            ("原因", "reason"), ("程式處理", "action"),
+        ):
+            value = alert.get(key)
+            if value not in (None, ""):
+                lines.append(f"{label}：{str(value)[:300]}")
+        payload: dict[str, Any] = {"content": "\n".join(lines), "allowed_mentions": {"parse": []}}
+        if user_id:
+            payload["allowed_mentions"]["users"] = [user_id]
+
+        alert_code = str(alert.get("alert_code") or "unknown")
+        for attempt in range(1, 4):
+            try:
+                response = await self.client.post(self.webhook_url, json=payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"DISCORD RISK ALERT ERROR ({type(exc).__name__}); attempt={attempt}/3", flush=True)
+            else:
+                if response.is_success:
+                    print(f"DISCORD RISK ALERT SENT code={alert_code}", flush=True)
+                    return
+                print(f"DISCORD RISK ALERT ERROR (HTTP {response.status_code}); attempt={attempt}/3", flush=True)
+            if attempt < 3:
+                await asyncio.sleep(float(attempt * 2))
 
     async def _send_summary(self) -> None:
         stats = self._stats()

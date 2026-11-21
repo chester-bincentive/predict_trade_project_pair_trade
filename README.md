@@ -37,7 +37,7 @@ Copy-Item .env.example .env
 .venv\Scripts\python.exe run.py live --execution-mode live
 ```
 
-Discord 通知是選用功能：在 Discord 目標伺服器的「伺服器設定 → 整合 → Webhooks」建立 incoming webhook，選擇接收頻道，並把 webhook URL 設為 `.env` 的 `PAIR_DISCORD_WEBHOOK_URL`。損益摘要依 `PAIR_DISCORD_PNL_INTERVAL_SECONDS` 定期推送；預設每 900 秒（15 分鐘），最短 60 秒。有效的 Live 交易鎖會另行立即告警，並 mention `PAIR_DISCORD_MENTION_USER_ID` 指定的使用者；市場／Token 驗證失敗、行情／交易主迴圈錯誤、低於最小賣出量、賣出餘額／授權拒單及退出行情暫時不可用只會記錄並按既有流程處理，不會另行提醒。告警只允許 mention 指定使用者，不會解析 `@everyone` 或角色。Webhook 欄位留白時不會推送任何 Discord 通知。Webhook URL 等同密碼，請勿分享或提交 `.env`；`.gitignore` 已排除 `.env`。
+Discord 通知是選用功能：在 Discord 目標伺服器的「伺服器設定 → 整合 → Webhooks」建立 incoming webhook，選擇接收頻道，並把 webhook URL 設為 `.env` 的 `PAIR_DISCORD_WEBHOOK_URL`。損益摘要依 `PAIR_DISCORD_PNL_INTERVAL_SECONDS` 定期推送；預設每 900 秒（15 分鐘），最短 60 秒。其他有效的 Live 交易風控情況會另行立即告警，並 mention `PAIR_DISCORD_MENTION_USER_ID` 指定的使用者；下單結果不明仍會為避免重複送單而暫停該市場到期，但不會另行提醒。市場／Token 驗證失敗、行情／交易主迴圈錯誤、低於最小賣出量、賣出餘額／授權拒單及退出行情暫時不可用也只會記錄並按既有流程處理，不會另行提醒。告警只允許 mention 指定使用者，不會解析 `@everyone` 或角色。Webhook 欄位留白時不會推送任何 Discord 通知。Webhook URL 等同密碼，請勿分享或提交 `.env`；`.gitignore` 已排除 `.env`。
 
 `python run.py live --duration-seconds 120` 會跑兩分鐘。預設資料庫為 `data/pair_trading.sqlite3`。`python run.py history-status` 查看校準進度；`python run.py report` 查看 paper/shadow 單腿成交率與損益。
 

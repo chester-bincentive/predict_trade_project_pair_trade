@@ -63,8 +63,10 @@ _LIVE_ALERT_POLICIES: dict[str, tuple[str, str, str]] = {
     ),
 }
 
-# These statuses are recorded, but intentionally do not generate Discord alerts.
+# These statuses remain in the ledger, but intentionally do not generate Discord
+# alerts. Any order lock they cause is handled independently by the live engine.
 for _status in (
+    "LIVE_ORDER_UNKNOWN",
     "LIVE_EXIT_BELOW_MINIMUM",
     "LIVE_SELL_BALANCE_RETRY",
     "LIVE_MARKET_VERIFY_FAILED",
@@ -154,13 +156,6 @@ class ShadowEngine:
 
     def set_risk_alert_callback(self, callback: Callable[[dict[str, Any]], None]) -> None:
         self._risk_alert_callback = callback
-        if self.live_executor is None or self.active is None:
-            return
-        if self.active.get("live_order_unknown"):
-            self._schedule_live_risk_alert(
-                self.active, "LIVE_ORDER_UNKNOWN",
-                phase=str(self.active.get("live_order_unknown_phase") or "TRADE"),
-            )
 
     def _schedule_live_risk_alert(
         self, state: dict[str, Any], status: str, *, phase: str,

@@ -8,7 +8,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 import uuid
 
 import httpx
@@ -155,28 +155,15 @@ class _FeedErrorLogger:
     def __init__(self) -> None:
         self.last_key: str | None = None
         self.last_logged_at = 0.0
-        self.alert_callback: Callable[[dict[str, Any]], None] | None = None
-
-    def set_alert_callback(self, callback: Callable[[dict[str, Any]], None]) -> None:
-        self.alert_callback = callback
 
     def report(self, exc: Exception) -> None:
         now = time.monotonic()
         safe_message = _FEED_ERROR_URL_QUERY_RE.sub(r"\1?[query redacted]", str(exc))
         key = f"{type(exc).__name__}: {safe_message}"
-        first_error_in_incident = self.last_key is None
         if key != self.last_key or now - self.last_logged_at >= LIVE_STATUS_LOG_INTERVAL_SECONDS:
             print(f"FEED ERROR ({type(exc).__name__}): {safe_message}; retrying", flush=True)
             self.last_key = key
             self.last_logged_at = now
-        if first_error_in_incident and self.alert_callback is not None:
-            self.alert_callback({
-                "dedupe_key": f"market-feed-outage:{time.time_ns()}",
-                "alert_code": "market_execution_loop_error",
-                "title": "行情／交易主迴圈發生錯誤",
-                "reason": type(exc).__name__,
-                "action": "新訊號處理可能暫停；程式會等待後重試，行情恢復後自動繼續。",
-            })
 
     def recovered(self) -> None:
         if self.last_key is not None:
@@ -403,7 +390,6 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
             )
             if execution_mode == "live":
                 engine.set_risk_alert_callback(notifier.schedule_alert)
-                feed_error_logger.set_alert_callback(notifier.schedule_alert)
             notifier_task = asyncio.create_task(notifier.run(), name="discord-pnl-notifier")
             if execution_mode == "live":
                 print(f"Discord notifications enabled; PnL interval={settings.discord_pnl_interval_seconds}s; "

@@ -63,11 +63,11 @@ _LIVE_ALERT_POLICIES: dict[str, tuple[str, str, str]] = {
     ),
 }
 
-# These execution outcomes are recorded for audit and settlement, but do not
-# stop future markets or generate Discord risk alerts.
+# These statuses are recorded, but intentionally do not generate Discord alerts.
 for _status in (
     "LIVE_EXIT_BELOW_MINIMUM",
     "LIVE_SELL_BALANCE_RETRY",
+    "LIVE_MARKET_VERIFY_FAILED",
     "LIVE_EXIT_NO_BID",
     "LIVE_EXIT_BOOK_UNAVAILABLE",
     "LIVE_EXIT_BOOK_STALE",

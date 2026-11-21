@@ -69,7 +69,15 @@ class ShadowEngine:
             store, window=settings.history_window_markets, rv_window=settings.rv_history_window_markets,
             bucket_seconds=settings.bucket_seconds
         )
-        self.active: dict[str, Any] | None = next(iter(store.open_shadow_trades()), None)
+        now = time.time()
+        self.active: dict[str, Any] | None = next((
+            state for state in store.open_shadow_trades()
+            if not state.get("live_order_quarantined")
+            and not (
+                state.get("live_order_unknown")
+                and float(state.get("market_end", float("inf"))) <= now
+            )
+        ), None)
         self.rng = random.SystemRandom()
         self.current_book_provider: Callable[[str, str], Book | None] | None = None
         self._process_lock = asyncio.Lock()
@@ -106,9 +114,27 @@ class ShadowEngine:
         # trade and runtime events, not the high-volume quote/depth snapshots.
         snapshot_ids: dict[tuple[str, str], int] = {}
 
+        if self.active is not None and self.active.get("live_order_unknown"):
+            if now.timestamp() >= float(self.active.get("market_end", float("inf"))):
+                unknown_state = self.active
+                unknown_state["live_order_quarantined"] = True
+                unknown_state["closed_at"] = now.isoformat()
+                self._event(
+                    unknown_state, "TRADE", None, side=None,
+                    status="UNRESOLVED_LIVE_ORDER_QUARANTINED",
+                    details={"new_trading_allowed": True,
+                             "market_expired": True,
+                             "account_reconciliation_still_required": True},
+                )
+                self._persist()
+                self.active = None
+            else:
+                return (
+                    "LIVE ORDER RESULT UNKNOWN; duplicate orders paused for this market; "
+                    "new markets are not locked after expiry"
+                )
+
         if self.active is not None:
-            if self.active.get("live_order_unknown"):
-                return "LIVE ORDER RESULT UNKNOWN; trading locked until the Polymarket account is reconciled"
 
             if self.active["market_key"] != snapshot.market_key:
                 if now.timestamp() < float(self.active["market_end"]):

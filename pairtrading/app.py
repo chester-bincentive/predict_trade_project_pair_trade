@@ -240,8 +240,12 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
             "order_delay_ms": {"polymarket": 0 if execution_mode == "live" else
                                 settings.poly_order_network_ms + settings.poly_order_api_ms},
             "live_buy_order_type": (
-                "FAK market; amount based on memory best ask; no explicit max_price"
+                f"pre-signed FAK market; target {settings.min_shares:g} shares; "
+                f"max_price=memory best ask+{settings.live_buy_max_price_ticks} ticks"
                 if execution_mode == "live" else None
+            ),
+            "live_buy_max_price_ticks": (
+                settings.live_buy_max_price_ticks if execution_mode == "live" else None
             ),
             "live_max_book_age_seconds": settings.live_max_book_age_seconds if execution_mode == "live" else None,
             "live_retry_interval_seconds": settings.live_retry_interval_seconds if execution_mode == "live" else None,
@@ -266,10 +270,16 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
         try:
             tick_size = await live_executor.verify_market(market)
             metadata = await live_executor.prewarm_order_metadata(market)
+            buy_order_pool = await live_executor.prepare_buy_order_pool(
+                market,
+                shares=settings.min_shares,
+                tick_size=tick_size,
+                max_price_ticks=settings.live_buy_max_price_ticks,
+            )
             details = {
                 "condition_id": market.condition_id, "tick_size": str(tick_size),
                 "sdk_metadata_prewarm": metadata,
-                "buy_order_prepare": "FAK market order signed from fresh SDK CLOB book at signal time",
+                "buy_order_prepare": buy_order_pool,
                 "recovered_sell_order_pools": await engine.prepare_open_live_sell_orders(
                     market, tick_size,
                 ),
@@ -312,8 +322,9 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
     feed_error_logger = _FeedErrorLogger()
     if execution_mode == "live":
         print("LIVE REAL ORDERS | Polymarket single-leg FAK orders are enabled; Binance supplies signal data only.")
-        print(f"Live execution: BUY FAK market order, no explicit max_price; USDC amount ≈ "
-              f"target shares × memory best ask, fees on top; max memory-book age="
+        print(f"Live execution: pre-signed BUY FAK; target={settings.min_shares:g} shares; "
+              f"max_price=best ask+{settings.live_buy_max_price_ticks} ticks; "
+              f"USDC amount=target shares × max_price, fees on top; max memory-book age="
               f"{settings.live_max_book_age_seconds:g}s; SELL FAK floor=$0.01; ledger={db_path}.")
     else:
         print("SHADOW MODE ONLY | Polymarket single-leg paper positions; Binance supplies signal data only; no real orders are sent.")

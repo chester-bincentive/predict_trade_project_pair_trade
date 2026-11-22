@@ -5,7 +5,7 @@ import json
 import random
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_UP
 from typing import Any, Callable
 
 from .config import Settings
@@ -101,13 +101,35 @@ def _partial_sweep(book: Book, *, side: str, shares: float, fee_coefficient: flo
     return filled, notional, fee
 
 
-def _live_market_buy_amount(requested_shares: float, best_ask: float) -> Decimal | None:
-    """Convert the nominal share target to a cent-rounded FAK market-buy notional."""
-    shares = Decimal(str(requested_shares))
+def _live_market_buy_max_price(
+    best_ask: float,
+    tick_size: Decimal | str,
+    max_price_ticks: int,
+) -> Decimal | None:
+    """Add the configured number of ticks to the current ask, capped at 1-tick."""
     ask = Decimal(str(best_ask))
-    if not shares.is_finite() or not ask.is_finite() or shares <= 0 or not Decimal("0") < ask < 1:
+    tick = Decimal(str(tick_size))
+    if (
+        not ask.is_finite() or not tick.is_finite()
+        or not Decimal("0") < ask < 1 or not Decimal("0") < tick < 1
+        or max_price_ticks < 1
+    ):
         return None
-    amount = (shares * ask).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    max_level = int((Decimal("1") - tick) // tick)
+    ask_level = int((ask / tick).to_integral_value(rounding=ROUND_UP))
+    cap_level = min(ask_level + max_price_ticks, max_level)
+    if cap_level < ask_level:
+        return None
+    return tick * cap_level
+
+
+def _live_market_buy_amount(requested_shares: float, max_price: Decimal | str) -> Decimal | None:
+    """Round up the USDC budget so a protected FAK can buy the target at its cap."""
+    shares = Decimal(str(requested_shares))
+    cap = Decimal(str(max_price))
+    if not shares.is_finite() or not cap.is_finite() or shares <= 0 or not Decimal("0") < cap < 1:
+        return None
+    amount = (shares * cap).quantize(Decimal("0.01"), rounding=ROUND_UP)
     return amount if amount > 0 else None
 
 
@@ -683,6 +705,7 @@ class ShadowEngine:
                                      "max_book_age_ms": self.settings.live_max_book_age_seconds * 1000.0})
                 return 0.0, 0.0, 0.0
             market_amount_usdc: Decimal | None = None
+            buy_max_price: Decimal | None = None
             limit_price: Decimal | None = None
             if phase == "ENTRY":
                 min_live_shares = max(5.0, self.settings.min_shares,
@@ -708,8 +731,15 @@ class ShadowEngine:
                                 book=book, snapshot_id=snapshot_ids.get((leg["venue"], leg["outcome"])),
                                 order=order, details={"reason": "no visible ask in current memory book"})
                     return 0.0, 0.0, 0.0
-                market_amount_usdc = _live_market_buy_amount(remaining, book.best_ask.price)
-                if market_amount_usdc is None:
+                buy_max_price = _live_market_buy_max_price(
+                    book.best_ask.price, tick_size,
+                    self.settings.live_buy_max_price_ticks,
+                )
+                market_amount_usdc = (
+                    None if buy_max_price is None
+                    else _live_market_buy_amount(remaining, buy_max_price)
+                )
+                if buy_max_price is None or market_amount_usdc is None:
                     order["live_result_recorded"] = True
                     order["live_result"] = {"filled": 0.0, "notional": 0.0, "fee": 0.0}
                     order["live_block_reason"] = "invalid_market_buy_notional"
@@ -719,7 +749,8 @@ class ShadowEngine:
                                 requested=remaining, filled=0.0, notional=0.0, fee=0.0,
                                 book=book, order=order,
                                 details={"best_ask": book.best_ask.price,
-                                         "requested_shares": remaining})
+                                         "requested_shares": remaining,
+                                         "max_price_ticks": self.settings.live_buy_max_price_ticks})
                     return 0.0, 0.0, 0.0
             else:
                 limit_price = Decimal("0.01")
@@ -774,12 +805,15 @@ class ShadowEngine:
                 "fee_accounting": "configured_fee_formula_applied_to_live_vwap",
             }
             if phase == "ENTRY":
-                assert market_amount_usdc is not None and book.best_ask is not None
+                assert (market_amount_usdc is not None and buy_max_price is not None
+                        and book.best_ask is not None)
                 intent_details.update({
                     "market_buy_amount_usdc": format(market_amount_usdc, "f"),
-                    "market_buy_amount_basis": "requested_shares_times_current_memory_best_ask",
-                    "sdk_price_context_source": "fresh_clob_book",
-                    "sdk_explicit_max_price": False,
+                    "market_buy_amount_basis": "requested_shares_times_max_price",
+                    "market_buy_max_price": format(buy_max_price, "f"),
+                    "market_buy_max_price_ticks": self.settings.live_buy_max_price_ticks,
+                    "sdk_price_context_source": "explicit_max_price_no_fresh_book",
+                    "sdk_explicit_max_price": True,
                     "nominal_share_target": remaining,
                     "memory_best_ask": book.best_ask.price,
                 })
@@ -805,21 +839,31 @@ class ShadowEngine:
                                      "seconds_left": seconds_left},
                         )
                         break
-                    retry_amount = _live_market_buy_amount(remaining, book.best_ask.price)
-                    if retry_amount is None:
+                    retry_max_price = _live_market_buy_max_price(
+                        book.best_ask.price, tick_size,
+                        self.settings.live_buy_max_price_ticks,
+                    )
+                    retry_amount = (
+                        None if retry_max_price is None
+                        else _live_market_buy_amount(remaining, retry_max_price)
+                    )
+                    if retry_max_price is None or retry_amount is None:
                         self._event(
                             state, phase, leg, side=side, status="LIVE_BUY_RETRY_SKIPPED",
                             requested=remaining, book=book, order=order,
                             details={**intent_details, "retry_count": 0,
                                      "reason": "invalid refreshed best ask for market-buy notional",
-                                     "best_ask": book.best_ask.price},
+                                     "best_ask": book.best_ask.price,
+                                     "max_price_ticks": self.settings.live_buy_max_price_ticks},
                         )
                         break
                     prior_market_amount = market_amount_usdc
                     market_amount_usdc = retry_amount
+                    buy_max_price = retry_max_price
                     intent_details = {
                         **intent_details,
                         "market_buy_amount_usdc": format(market_amount_usdc, "f"),
+                        "market_buy_max_price": format(buy_max_price, "f"),
                         "memory_best_ask": book.best_ask.price,
                         "book_received_at": book.received_at.timestamp(),
                         "book_source_at": None if book.source_at is None else book.source_at.timestamp(),
@@ -872,10 +916,12 @@ class ShadowEngine:
 
                 try:
                     if phase == "ENTRY":
-                        assert market_amount_usdc is not None
+                        assert market_amount_usdc is not None and buy_max_price is not None
                         accepted, fill, response_details = await self.live_executor.buy_fak(
                             asset_id=leg["token_id"], requested_qty=remaining,
                             market_amount_usdc=market_amount_usdc,
+                            max_price=buy_max_price,
+                            tick_size=tick_size,
                             on_order_signed=record_signed_order,
                             timing_context=timing_context,
                         )

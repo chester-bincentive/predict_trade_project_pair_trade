@@ -37,6 +37,7 @@ class Settings:
     trading_mode: str = "paper"
     live_db_path: Path = Path("data/live_pair_trading.sqlite3")
     live_max_book_age_seconds: float = 2.0
+    live_buy_max_price_ticks: int = 15
     live_retry_interval_seconds: float = 1.0
     resolution_grace_seconds: float = 900.0
     discord_webhook_url: str = ""
@@ -81,6 +82,9 @@ class Settings:
                 "PAIR_LIVE_DB_PATH", str(default_db.with_name("live_pair_trading.sqlite3"))
             )),
             live_max_book_age_seconds=_float_env("PAIR_LIVE_MAX_BOOK_AGE_SECONDS", 2.0, minimum=0.1),
+            live_buy_max_price_ticks=_int_env(
+                "PAIR_LIVE_BUY_MAX_PRICE_TICKS", 15, minimum=1
+            ),
             live_retry_interval_seconds=_float_env(
                 "PAIR_LIVE_RETRY_INTERVAL_SECONDS", 1.0, minimum=0.1
             ),

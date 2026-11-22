@@ -8,7 +8,7 @@ import re
 import time
 from contextvars import ContextVar, Token
 from dataclasses import replace
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_UP
 from typing import Any, Callable
 
 from .credstore_bridge import fetch_private_key
@@ -33,6 +33,12 @@ _HTTPCORE_TRACE_EVENT_PREFIXES = (
     "http11.send_request_body.",
     "http11.receive_response_headers.",
 )
+
+
+def _market_buy_amount_for_shares(shares: str | Decimal, max_price: str | Decimal) -> Decimal:
+    """Return a cent-rounded-up USDC budget for the requested shares at the cap."""
+    amount = Decimal(str(shares)) * Decimal(str(max_price))
+    return amount.quantize(Decimal("0.01"), rounding=ROUND_UP)
 
 
 class LiveOrderUnknown(RuntimeError):
@@ -180,13 +186,13 @@ class PolymarketLiveExecutor:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._last_keepalive_warning_monotonic = 0.0
         self._prepared_buy_orders: dict[
-            tuple[str, str, str], tuple[Any, int, tuple[str, str, str]]
+            tuple[str, str, str], tuple[Any, int, tuple[str, str, str, str]]
         ] = {}
         self._prepared_buy_pool_specs: dict[
-            tuple[str, str, str], tuple[Market, str]
+            tuple[str, str, str, str], tuple[Market, str, Decimal, int]
         ] = {}
-        self._prepared_buy_pool_ready: set[tuple[str, str, str]] = set()
-        self._prepared_buy_pool_preparing: set[tuple[str, str, str]] = set()
+        self._prepared_buy_pool_ready: set[tuple[str, str, str, str]] = set()
+        self._prepared_buy_pool_preparing: set[tuple[str, str, str, str]] = set()
         self._prepared_buy_refills_inflight: set[tuple[str, str, str]] = set()
         self._prepared_sell_orders: dict[
             tuple[str, str, str, str], tuple[Any, int]
@@ -314,14 +320,14 @@ class PolymarketLiveExecutor:
     def _schedule_prepared_buy_order_refill(
         self,
         key: tuple[str, str, str],
-        pool_key: tuple[str, str, str],
+        pool_key: tuple[str, str, str, str],
     ) -> None:
         if self.client is None or key in self._prepared_buy_refills_inflight:
             return
         spec = self._prepared_buy_pool_specs.get(pool_key)
         if spec is None:
             return
-        market, size = spec
+        market, size, _, _ = spec
         if market.end_ns <= time.time_ns():
             return
         self._prepared_buy_refills_inflight.add(key)
@@ -335,7 +341,7 @@ class PolymarketLiveExecutor:
     async def _refill_prepared_buy_order(
         self,
         key: tuple[str, str, str],
-        pool_key: tuple[str, str, str],
+        pool_key: tuple[str, str, str, str],
         market: Market,
         size: str,
     ) -> None:
@@ -345,12 +351,12 @@ class PolymarketLiveExecutor:
             await asyncio.sleep(1.0)
             if self.client is None or market.end_ns <= time.time_ns():
                 return
-            signed_order = await self.client.create_limit_order(
+            signed_order = await self.client.create_market_order(
                 asset_id=key[0],
                 side="BUY",
-                price=key[2],
-                size=size,
-                post_only=False,
+                amount=format(_market_buy_amount_for_shares(size, key[2]), "f"),
+                max_price=key[2],
+                order_type="FAK",
             )
             fak_order = replace(signed_order, order_type="FAK")
             if self.client is not None and market.end_ns > time.time_ns():
@@ -449,8 +455,9 @@ class PolymarketLiveExecutor:
         *,
         shares: float,
         tick_size: Decimal | str,
+        max_price_ticks: int = 15,
     ) -> dict[str, Any]:
-        """Pre-sign one-use BUY FAK orders for each legal price in the market tick grid."""
+        """Pre-sign protected BUY FAKs for each possible ask-derived max price."""
         if self.client is None:
             raise RuntimeError("Polymarket account is not connected")
         self._prune_expired_prepared_buy_orders()
@@ -458,18 +465,24 @@ class PolymarketLiveExecutor:
         tick = Decimal(str(tick_size))
         if not tick.is_finite() or tick <= 0 or tick >= 1:
             raise ValueError("market tick size must be between 0 and 1")
-        pool_key = (market.condition_id.lower(), size, format(tick, "f"))
+        if max_price_ticks < 1:
+            raise ValueError("max_price_ticks must be at least one")
+        pool_key = (
+            market.condition_id.lower(), size, format(tick, "f"), str(max_price_ticks)
+        )
         if pool_key in self._prepared_buy_pool_ready:
             return {
                 "status": "already_ready",
                 "prepared_orders": 0,
                 "tick_size": format(tick, "f"),
+                "max_price_ticks": max_price_ticks,
             }
         if pool_key in self._prepared_buy_pool_preparing:
             return {
                 "status": "already_preparing",
                 "prepared_orders": 0,
                 "tick_size": format(tick, "f"),
+                "max_price_ticks": max_price_ticks,
             }
 
         verified = self._verified_markets.get(market.condition_id.lower())
@@ -480,12 +493,19 @@ class PolymarketLiveExecutor:
         ):
             raise ValueError("market condition and outcome assets must be account-verified before presigning")
         self._prepared_buy_pool_preparing.add(pool_key)
-        self._prepared_buy_pool_specs[pool_key] = (market, size)
+        self._prepared_buy_pool_specs[pool_key] = (market, size, tick, max_price_ticks)
         started_ns = time.perf_counter_ns()
         prepared_count = 0
         try:
-            price_level_count = int((Decimal("1") - tick) // tick)
-            candidate_count = price_level_count * 2
+            max_price_level = int((Decimal("1") - tick) // tick)
+            if max_price_level < 1:
+                raise ValueError("market tick size leaves no legal BUY max_price")
+            max_legal_price = tick * max_price_level
+            max_price_levels = sorted({
+                tick * min(ask_level + max_price_ticks, max_price_level)
+                for ask_level in range(1, max_price_level + 1)
+            })
+            candidate_count = len(max_price_levels) * 2
             if candidate_count > self._MAX_PREPARED_BUY_ORDERS_PER_MARKET:
                 self._prepared_buy_pool_ready.add(pool_key)
                 return {
@@ -494,25 +514,25 @@ class PolymarketLiveExecutor:
                     "candidate_orders": candidate_count,
                     "candidate_limit": self._MAX_PREPARED_BUY_ORDERS_PER_MARKET,
                     "tick_size": format(tick, "f"),
+                    "max_price_ticks": max_price_ticks,
                     "prepare_elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
                 }
 
             assets = (str(market.up_asset_id), str(market.down_asset_id))
             for asset_id in assets:
-                for level in range(1, price_level_count + 1):
+                for price in max_price_levels:
                     if self.client is None or market.end_ns <= time.time_ns():
                         break
-                    price = tick * level
                     price_text = format(price, "f")
                     key = self._prepared_buy_order_key(asset_id, size, price_text)
                     if key in self._prepared_buy_orders:
                         continue
-                    signed_order = await self.client.create_limit_order(
+                    signed_order = await self.client.create_market_order(
                         asset_id=asset_id,
                         side="BUY",
-                        price=price_text,
-                        size=size,
-                        post_only=False,
+                        amount=format(_market_buy_amount_for_shares(size, price), "f"),
+                        max_price=price_text,
+                        order_type="FAK",
                     )
                     self._prepared_buy_orders[key] = (
                         replace(signed_order, order_type="FAK"),
@@ -526,8 +546,11 @@ class PolymarketLiveExecutor:
             return {
                 "status": "ready",
                 "prepared_orders": prepared_count,
-                "price_levels_per_asset": price_level_count,
+                "max_price_levels_per_asset": len(max_price_levels),
                 "tick_size": format(tick, "f"),
+                "max_price_ticks": max_price_ticks,
+                "minimum_max_price": format(min(max_price_levels), "f"),
+                "maximum_max_price": format(min(max_price_levels[-1], max_legal_price), "f"),
                 "prepare_elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
             }
         finally:
@@ -540,7 +563,7 @@ class PolymarketLiveExecutor:
                 self._prepared_buy_orders.pop(key, None)
         expired_pools = {
             key
-            for key, (market, _) in self._prepared_buy_pool_specs.items()
+            for key, (market, _, _, _) in self._prepared_buy_pool_specs.items()
             if market.end_ns <= now_ns
         }
         for key in expired_pools:
@@ -1018,6 +1041,8 @@ class PolymarketLiveExecutor:
         asset_id: str,
         requested_qty: float,
         market_amount_usdc: Decimal | str | float,
+        max_price: Decimal | str | float,
+        tick_size: Decimal | str,
         on_order_signed: Callable[[dict[str, Any]], None] | None = None,
         timing_context: dict[str, Any] | None = None,
     ) -> tuple[bool, Fill | None, dict[str, Any]]:
@@ -1026,6 +1051,8 @@ class PolymarketLiveExecutor:
             asset_id=asset_id,
             requested_qty=requested_qty,
             market_amount_usdc=market_amount_usdc,
+            max_price=max_price,
+            tick_size=tick_size,
             on_order_signed=on_order_signed,
             timing_context=timing_context,
         )
@@ -1059,6 +1086,7 @@ class PolymarketLiveExecutor:
         requested_qty: float,
         shares: float | None = None,
         market_amount_usdc: Decimal | str | float | None = None,
+        max_price: Decimal | str | float | None = None,
         limit_price: Decimal | str | float | None = None,
         tick_size: Decimal | str | None = None,
         on_order_signed: Callable[[dict[str, Any]], None] | None = None,
@@ -1068,6 +1096,7 @@ class PolymarketLiveExecutor:
             raise RuntimeError("Polymarket account is not connected")
         is_buy = side.upper() == "BUY"
         market_amount_decimal: Decimal | None = None
+        max_price_decimal: Decimal | None = None
         limit_price_decimal: Decimal | None = None
         if is_buy:
             if market_amount_usdc is None:
@@ -1075,6 +1104,15 @@ class PolymarketLiveExecutor:
             market_amount_decimal = Decimal(str(market_amount_usdc))
             if not market_amount_decimal.is_finite() or market_amount_decimal <= 0:
                 raise ValueError("BUY market FAK amount must be a positive USDC amount")
+            if max_price is None:
+                raise ValueError("max_price is required for BUY market FAK orders")
+            max_price_decimal = Decimal(str(max_price))
+            if not max_price_decimal.is_finite() or not Decimal("0") < max_price_decimal < 1:
+                raise ValueError("BUY max_price must be between 0 and 1")
+            if tick_size is not None:
+                tick_decimal = Decimal(str(tick_size))
+                if tick_decimal <= 0 or tick_decimal >= 1 or max_price_decimal % tick_decimal != 0:
+                    raise ValueError("BUY max_price must conform to the current tick size")
         else:
             if shares is None or limit_price is None:
                 raise ValueError("shares and limit_price are required for SELL FAK orders")
@@ -1092,15 +1130,24 @@ class PolymarketLiveExecutor:
         order_create_started_ns = time.perf_counter_ns()
         try:
             if is_buy:
-                # No max_price is passed. The SDK fetches the current CLOB book,
-                # derives its market-order price context, and signs a FAK order.
-                fak_order = await self.client.create_market_order(
-                    asset_id=asset_id,
-                    side="BUY",
-                    amount=format(market_amount_decimal, "f"),
-                    order_type="FAK",
+                size_text = f"{requested_qty:.6f}"
+                assert max_price_decimal is not None
+                fak_order = self._take_prepared_buy_order(
+                    asset_id, size_text, max_price_decimal,
                 )
-                order_prepare_source = "fresh_market_book_estimate_then_sign"
+                if fak_order is not None:
+                    order_prepare_source = "pre_signed_market_buy_pool"
+                else:
+                    # With max_price the SDK uses its prewarmed market metadata
+                    # and signs locally without fetching a fresh /book.
+                    fak_order = await self.client.create_market_order(
+                        asset_id=asset_id,
+                        side="BUY",
+                        amount=format(market_amount_decimal, "f"),
+                        max_price=format(max_price_decimal, "f"),
+                        order_type="FAK",
+                    )
+                    order_prepare_source = "protected_market_order_signed_on_demand"
             else:
                 size_text = f"{shares:.6f}"
                 fak_order = self._take_prepared_sell_order(
@@ -1142,7 +1189,9 @@ class PolymarketLiveExecutor:
                     "sdk_market_amount_usdc": (
                         format(market_amount_decimal, "f") if is_buy else None
                     ),
-                    "sdk_explicit_max_price": None,
+                    "sdk_explicit_max_price": (
+                        format(max_price_decimal, "f") if is_buy else None
+                    ),
                     "sdk_limit_price": (
                         None if is_buy else format(limit_price_decimal, "f")
                     ),
@@ -1167,13 +1216,15 @@ class PolymarketLiveExecutor:
             {
                 "sdk_order_type": "FAK",
                 "sdk_post_only": False,
-                "sdk_explicit_max_price": None,
+                "sdk_explicit_max_price": (
+                    format(max_price_decimal, "f") if is_buy else None
+                ),
                 "sdk_limit_price": None if is_buy else format(limit_price_decimal, "f"),
                 "sdk_market_amount_usdc": (
                     format(market_amount_decimal, "f") if is_buy else None
                 ),
                 "sdk_market_price_source": (
-                    "fresh_sdk_clob_book_market_order" if is_buy else None
+                    "explicit_max_price_no_fresh_book" if is_buy else None
                 ),
                 "sdk_order_prepare_source": trace.get("order_prepare_source", "on_demand_sign"),
             }

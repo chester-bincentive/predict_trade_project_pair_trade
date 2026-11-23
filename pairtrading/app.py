@@ -476,6 +476,7 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
             if exit_watchdog_task is not None:
                 exit_watchdog_task.cancel()
                 await asyncio.gather(exit_watchdog_task, return_exceptions=True)
+            await engine.stop_live_background_tasks()
         finally:
             try:
                 if notifier_task is not None:

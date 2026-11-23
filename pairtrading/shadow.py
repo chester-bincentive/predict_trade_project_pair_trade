@@ -170,6 +170,9 @@ class ShadowEngine:
         self.rng = random.SystemRandom()
         self.current_book_provider: Callable[[str, str], Book | None] | None = None
         self._process_lock = asyncio.Lock()
+        self._live_exit_task: asyncio.Task[None] | None = None
+        self._live_exit_inflight_trade_id: int | None = None
+        self._live_presign_tasks: set[asyncio.Task[None]] = set()
         if live_executor is not None and self.active is not None:
             if self.active.get("trading_mode") != "live":
                 raise ValueError("live mode will not resume an open paper/shadow trade")
@@ -226,6 +229,9 @@ class ShadowEngine:
             rv10 = self.calibration.observe(snapshot, spread, bucket)
         else:
             rv10 = None
+        if (self._live_exit_inflight_trade_id is not None
+                or self._live_exit_worker_running()):
+            return "LIVE EXIT pending; isolated close worker owns the current order"
         # Books stay in memory for signal evaluation and fills. Persist only
         # trade and runtime events, not the high-volume quote/depth snapshots.
         snapshot_ids: dict[tuple[str, str], int] = {}
@@ -343,7 +349,14 @@ class ShadowEngine:
                     f"historical q90={rv_q90:.6f} (n={rv_history_n})")
         if self.active is not None:
             return "HOLD existing shadow trade; no stacking"
-        if self.store.has_shadow_trade(snapshot.market_key) or self.store.has_position_or_trade(snapshot.market_key):
+        already_traded = self.store.has_shadow_trade(snapshot.market_key)
+        safe_live_reentry = (
+            self.live_executor is not None
+            and already_traded
+            and self.store.can_reenter_live_after_confirmed_no_fill(snapshot.market_key)
+        )
+        if ((already_traded and not safe_live_reentry)
+                or self.store.has_position_or_trade(snapshot.market_key)):
             return f"HOLD one-trade-per-market already used OU={ou_score:+.2f}"
 
         if ou_score < 0.0:
@@ -451,17 +464,20 @@ class ShadowEngine:
                 state is None or state.get("market_key") != market.key
                 or not state.get("entries_resolved")
                 or float(state.get("paired_shares", 0.0)) <= 1e-9
+                or self._live_exit_inflight_trade_id is not None
+                or self._live_exit_worker_running()
             ):
                 return 0
-            prepared = 0
-            for leg in state["legs"]:
-                remaining = float(leg.get("exit_remaining", 0.0))
-                if remaining > 1e-9:
-                    await self._prepare_live_sell_order(
-                        state, leg, market, remaining, str(tick_size),
-                    )
-                    prepared += 1
-            return prepared
+            pending = [
+                (leg, float(leg.get("exit_remaining", 0.0)))
+                for leg in state["legs"]
+                if float(leg.get("exit_remaining", 0.0)) > 1e-9
+            ]
+        for leg, remaining in pending:
+            await self._prepare_live_sell_order(
+                state, leg, market, remaining, str(tick_size),
+            )
+        return len(pending)
 
     def _current_book(self, snapshot: PairSnapshot | None, leg: dict[str, Any]) -> Book | None:
         if self.live_executor is not None and self.current_book_provider is not None:
@@ -876,6 +892,19 @@ class ShadowEngine:
                     }
 
                 now = datetime.now(timezone.utc)
+                if phase == "EXIT" and now.timestamp() >= float(state["market_end"]):
+                    order["live_result_recorded"] = True
+                    order["live_result"] = {"filled": 0.0, "notional": 0.0, "fee": 0.0}
+                    order["live_block_reason"] = "market_ended_before_exit_post"
+                    self._persist()
+                    self._event(
+                        state, phase, leg, side="SELL", status="LIVE_EXIT_MARKET_ENDED",
+                        requested=remaining, filled=0.0, notional=0.0, fee=0.0,
+                        book=book, order=order,
+                        details={"reason": "market ended before the sell request was posted",
+                                 "market_end_epoch": state["market_end"]},
+                    )
+                    return 0.0, 0.0, 0.0
                 intent_ns = time.time_ns()
                 if attempt_number > 1:
                     trigger_ns = int(order.get("last_no_fill_ns", intent_ns))
@@ -1052,22 +1081,302 @@ class ShadowEngine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._event(
-                state, "SELL_PRESIGN", leg, side="SELL",
-                status="LIVE_SELL_PRESIGN_FAILED", requested=shares,
-                details={"error_type": type(exc).__name__,
-                         "reason": "sell will fall back to on-demand signing"},
-            )
-            self._persist()
+            async with self._process_lock:
+                self._event(
+                    state, "SELL_PRESIGN", leg, side="SELL",
+                    status="LIVE_SELL_PRESIGN_FAILED", requested=shares,
+                    details={"error_type": type(exc).__name__,
+                             "reason": "sell will fall back to on-demand signing"},
+                )
+                self._persist()
             return
         if result.get("status") == "ready":
+            async with self._process_lock:
+                self._event(
+                    state, "SELL_PRESIGN", leg, side="SELL",
+                    status="LIVE_SELL_PRESIGNED", requested=shares,
+                    details={**result, "limit_price": "0.01",
+                             "note": "signed order only; no sell was submitted"},
+                )
+                self._persist()
+
+    def _queue_live_sell_presign(
+        self, state: dict[str, Any], leg: dict[str, Any], market: Market,
+        shares: float, tick_size: Any,
+    ) -> None:
+        if self.live_executor is None or tick_size is None or shares <= 1e-9:
+            return
+        task = asyncio.create_task(
+            self._prepare_live_sell_order(state, leg, market, shares, tick_size),
+            name=f"live-sell-presign-{state.get('trade_id', 'unknown')}",
+        )
+        self._live_presign_tasks.add(task)
+
+        def discard_finished(done: asyncio.Task[None]) -> None:
+            self._live_presign_tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                print(f"LIVE SELL PRESIGN WORKER ERROR ({type(error).__name__})", flush=True)
+
+        task.add_done_callback(discard_finished)
+
+    def _queue_live_exit_attempt(
+        self, state: dict[str, Any], leg: dict[str, Any],
+        order: dict[str, Any], market: Market,
+    ) -> None:
+        if self.live_executor is None:
+            return
+        if self._live_exit_inflight_trade_id == int(state["trade_id"]):
+            return
+        current = self._live_exit_task
+        if current is not None and not current.done():
+            return
+        queued_epoch = time.time()
+        self.store.record_runtime_event(
+            run_id=self.run_id or "live-exit-worker",
+            event_type="live_exit_worker_queued",
+            market_key=str(state["market_key"]), venue="polymarket",
+            details={"trade_id": int(state["trade_id"]), "leg": str(leg["name"]),
+                     "reason": state.get("exit_reason"),
+                     "order_arrival_epoch": order.get("arrival")},
+        )
+        task = asyncio.create_task(
+            self._run_live_exit_attempt(
+                int(state["trade_id"]), str(leg["name"]), order, market, queued_epoch,
+            ),
+            name=f"live-exit-order-{state['trade_id']}",
+        )
+        self._live_exit_task = task
+
+        def report_worker_error(done: asyncio.Task[None]) -> None:
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                print(f"LIVE EXIT WORKER ERROR ({type(error).__name__}); order state retained", flush=True)
+
+        task.add_done_callback(report_worker_error)
+
+    def _live_exit_worker_running(self) -> bool:
+        return self._live_exit_task is not None and not self._live_exit_task.done()
+
+    def _mark_live_settlement_pending(self, state: dict[str, Any], reason: str) -> None:
+        if state.get("status") != "SETTLEMENT_PENDING":
+            state["status"] = "SETTLEMENT_PENDING"
+            state["live_position_unresolved"] = False
+            state["closed_at"] = datetime.now(timezone.utc).isoformat()
+            remaining = sum(float(leg.get("exit_remaining", 0.0)) for leg in state["legs"])
             self._event(
-                state, "SELL_PRESIGN", leg, side="SELL",
-                status="LIVE_SELL_PRESIGNED", requested=shares,
-                details={**result, "limit_price": "0.01",
-                         "note": "signed order only; no sell was submitted"},
+                state, "TRADE", None, side=None, status="SETTLEMENT_PENDING",
+                details={"position_shares": remaining,
+                         "settlement_status": "awaiting Polymarket market resolution",
+                         "reason": reason, "new_trading_allowed": True},
             )
             self._persist()
+        if self.active is state:
+            self.active = None
+        self._settle_known_resolution(state)
+
+    async def _run_live_exit_attempt(
+        self, trade_id: int, leg_name: str, expected_order: dict[str, Any],
+        market: Market, queued_epoch: float,
+    ) -> None:
+        state: dict[str, Any] | None = None
+        leg: dict[str, Any] | None = None
+        claimed = False
+        remaining = 0.0
+        outcome = "not_claimed"
+        started = time.monotonic()
+        try:
+            async with self._process_lock:
+                state = self.active
+                if (
+                    state is None or int(state.get("trade_id", -1)) != trade_id
+                    or state.get("live_order_unknown")
+                    or state.get("status") == "SETTLEMENT_PENDING"
+                    or self._live_exit_inflight_trade_id is not None
+                ):
+                    return
+                leg = next((item for item in state["legs"] if str(item["name"]) == leg_name), None)
+                if (
+                    leg is None or leg.get("exit_order") is not expected_order
+                    or float(leg.get("exit_remaining", 0.0)) <= 1e-9
+                    or time.time() + 1e-6 < float(expected_order.get("arrival", 0.0))
+                ):
+                    return
+                if time.time() >= float(state["market_end"]):
+                    self._mark_live_settlement_pending(state, "exit worker woke after market end")
+                    outcome = "market_ended_before_submit"
+                    return
+                remaining = float(leg["exit_remaining"])
+                self._live_exit_inflight_trade_id = trade_id
+                claimed = True
+                self._persist()
+                self.store.record_runtime_event(
+                    run_id=self.run_id or "live-exit-worker",
+                    event_type="live_exit_worker_started",
+                    market_key=str(state["market_key"]), venue="polymarket",
+                    details={"trade_id": trade_id, "leg": leg_name,
+                             "reason": state.get("exit_reason"),
+                             "remaining_shares": remaining,
+                             "order_arrival_epoch": expected_order.get("arrival"),
+                             "queue_wait_ms": round((time.time() - queued_epoch) * 1000.0, 3),
+                             "state_lock_released_during_submit": True},
+                )
+
+            try:
+                attempt = await self._attempt(
+                    state, leg, "EXIT", remaining, expected_order, None, {}, market=market,
+                )
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
+            except Exception as exc:
+                if expected_order.get("live_result_recorded"):
+                    result = expected_order.get("live_result") or {}
+                    attempt = (
+                        float(result.get("filled", 0.0)),
+                        float(result.get("notional", 0.0)),
+                        float(result.get("fee", 0.0)),
+                    )
+                else:
+                    async with self._process_lock:
+                        if self.active is state and self._live_exit_inflight_trade_id == trade_id:
+                            if expected_order.get("live_api_started"):
+                                state["live_order_unknown"] = True
+                                state["live_order_unknown_phase"] = "EXIT"
+                                state["status"] = "UNRESOLVED_LIVE_ORDER"
+                                expected_order["live_unknown"] = True
+                                self._event(
+                                    state, "EXIT", leg, side="SELL", status="LIVE_ORDER_UNKNOWN",
+                                    requested=remaining, order=expected_order,
+                                    details={"error_type": type(exc).__name__,
+                                             "reason": "exit worker failed after persisting API intent",
+                                             "manual_account_reconciliation_required": True},
+                                )
+                            else:
+                                self._event(
+                                    state, "EXIT", leg, side="SELL",
+                                    status="LIVE_EXIT_WORKER_RETRY", requested=remaining,
+                                    order=expected_order,
+                                    details={"error_type": type(exc).__name__,
+                                             "reason": "failure occurred before API intent; safe to retry"},
+                                )
+                                expected_order["arrival"] = (
+                                    time.time() + self.settings.live_retry_interval_seconds
+                                )
+                                expected_order["wait_for_update"] = True
+                            self._persist()
+                    outcome = "error_unknown" if state.get("live_order_unknown") else "pre_submit_retry"
+                    return
+
+            async with self._process_lock:
+                if self.active is not state or self._live_exit_inflight_trade_id != trade_id:
+                    outcome = "state_changed"
+                    return
+                if state.get("live_order_unknown"):
+                    outcome = "order_unknown"
+                    return
+                if state.get("status") == "SETTLEMENT_PENDING":
+                    outcome = "settlement_pending"
+                    return
+                if attempt is None:
+                    if time.time() >= float(state["market_end"]):
+                        self._mark_live_settlement_pending(state, "exit attempt completed after market end")
+                        outcome = "settlement_pending"
+                    else:
+                        outcome = "waiting_for_fresh_book"
+                        self._persist()
+                    return
+
+                filled, proceeds, fee = attempt
+                leg["exit_remaining"] = max(0.0, remaining - filled)
+                leg["exit_filled"] = float(leg.get("exit_filled", 0.0)) + filled
+                leg["exit_value"] = float(leg.get("exit_value", 0.0)) + proceeds
+                leg["exit_fee"] = float(leg.get("exit_fee", 0.0)) + fee
+                state["exit_value"] = float(state.get("exit_value", 0.0)) + proceeds
+                state["exit_fee"] = float(state.get("exit_fee", 0.0)) + fee
+
+                all_exited = all(float(item.get("exit_remaining", 0.0)) <= 1e-9
+                                 for item in state["legs"])
+                if all_exited:
+                    state["status"] = "CLOSED"
+                    state["net_pnl"] = (
+                        float(state["exit_value"]) - float(state["exit_fee"])
+                        - float(state["entry_cost"]) - float(state["entry_fee"])
+                    )
+                    state["closed_at"] = datetime.now(timezone.utc).isoformat()
+                    self._event(
+                        state, "TRADE", None, side=None, status="CLOSED",
+                        details={"position_shares": state["paired_shares"],
+                                 "entry_cost": state["entry_cost"],
+                                 "entry_fee": state["entry_fee"],
+                                 "exit_value": state["exit_value"],
+                                 "exit_fee": state["exit_fee"],
+                                 "net_pnl": state["net_pnl"]},
+                    )
+                    self._persist()
+                    self.active = None
+                    outcome = "closed"
+                    return
+                if time.time() >= float(state["market_end"]):
+                    self._mark_live_settlement_pending(
+                        state, "exit remainder remained when market ended",
+                    )
+                    outcome = "settlement_pending"
+                    return
+                self._persist()
+
+            if float(leg["exit_remaining"]) > 1e-9:
+                async with self._process_lock:
+                    if self.active is not state or self._live_exit_inflight_trade_id != trade_id:
+                        outcome = "state_changed_before_retry_schedule"
+                        return
+                    if time.time() >= float(state["market_end"]):
+                        self._mark_live_settlement_pending(
+                            state, "exit retry could not be scheduled before market end",
+                        )
+                        outcome = "settlement_pending"
+                        return
+                    immediate_retry = bool(
+                        expected_order.get("live_accepted")
+                        or expected_order.get("live_fak_no_fill_confirmed")
+                    )
+                    leg["exit_order"] = self._schedule(
+                        state, leg, "EXIT", float(leg["exit_remaining"]), time.time(),
+                        wait_for_update=not immediate_retry,
+                    )
+                    self._queue_live_sell_presign(
+                        state, leg, market, float(leg["exit_remaining"]),
+                        expected_order.get("live_tick_size"),
+                    )
+                    self._persist()
+                    outcome = "retry_scheduled"
+        finally:
+            if claimed:
+                async with self._process_lock:
+                    if self._live_exit_inflight_trade_id == trade_id:
+                        self._live_exit_inflight_trade_id = None
+                    self.store.record_runtime_event(
+                        run_id=self.run_id or "live-exit-worker",
+                        event_type="live_exit_worker_finished",
+                        market_key=str(state["market_key"]), venue="polymarket",
+                        details={"trade_id": trade_id, "outcome": outcome,
+                                 "elapsed_ms": round((time.monotonic() - started) * 1000.0, 3),
+                                 "queue_to_finish_ms": round((time.time() - queued_epoch) * 1000.0, 3)},
+                    )
+
+    async def stop_live_background_tasks(self) -> None:
+        tasks: list[asyncio.Task[Any]] = []
+        if self._live_exit_task is not None and not self._live_exit_task.done():
+            tasks.append(self._live_exit_task)
+        tasks.extend(task for task in self._live_presign_tasks if not task.done())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _advance(self, snapshot: PairSnapshot | None,
                        snapshot_ids: dict[tuple[str, str], int],
@@ -1189,7 +1498,7 @@ class ShadowEngine:
             dirty = True
             if self.live_executor is not None and paired > 1e-9:
                 for leg in state["legs"]:
-                    await self._prepare_live_sell_order(
+                    self._queue_live_sell_presign(
                         state, leg, market, float(leg["exit_remaining"]),
                         leg.get("entry_order", {}).get("live_tick_size"),
                     )
@@ -1237,6 +1546,7 @@ class ShadowEngine:
                         )
 
         exit_trigger_message = None
+        live_exit_dispatch = False
         if state["entries_resolved"] and float(state["paired_shares"]) > 1e-9:
             if state.get("exit_mode") == "directional_ou_threshold":
                 exit_ou_score = None
@@ -1279,6 +1589,7 @@ class ShadowEngine:
                         else f"{self._status_prefix} EXIT TRIGGER {reason}; OU unavailable"
                     )
                     dirty = True
+                    live_exit_dispatch = self.live_executor is not None
                 if state.get("exit_triggered"):
                     for leg in state["legs"]:
                         if leg["exit_order"] is None and float(leg["exit_remaining"]) > 1e-9:
@@ -1287,6 +1598,7 @@ class ShadowEngine:
                                 time.time() if self.live_executor is not None else now,
                             )
                             dirty = True
+                            live_exit_dispatch = self.live_executor is not None
             else:
                 legacy_due = state.get("hold_due_epoch")
                 if (legacy_due is not None and now >= float(legacy_due)
@@ -1298,10 +1610,15 @@ class ShadowEngine:
                                 time.time() if self.live_executor is not None else now,
                             )
                             dirty = True
+                            live_exit_dispatch = self.live_executor is not None
             for leg in state["legs"]:
                 remaining = float(leg["exit_remaining"])
                 order = leg.get("exit_order")
                 if remaining > 1e-9 and order is not None:
+                    if self.live_executor is not None:
+                        if snapshot is None or live_exit_dispatch:
+                            self._queue_live_exit_attempt(state, leg, order, market)
+                        continue
                     attempt = await self._attempt(
                         state, leg, "EXIT", remaining, order, snapshot, snapshot_ids,
                         market=market,
@@ -1433,6 +1750,17 @@ class ShadowEngine:
         if winner not in {market.up_token, market.down_token}:
             return False
 
+        active = self.active
+        if (
+            active is not None
+            and (self._live_exit_inflight_trade_id == int(active.get("trade_id", -1))
+                 or self._live_exit_worker_running())
+            and active.get("market_key") == market.key
+        ):
+            # Persist the resolution above, then let the exit worker apply its
+            # definitive order response before settling any remaining shares.
+            return False
+
         state = self.store.shadow_trade_for_market(market.key)
         if state is None or state.get("status") == "SETTLED":
             return False
@@ -1533,11 +1861,14 @@ class ShadowEngine:
                     due.append(float(order["arrival"]))
             for phase, remaining_key in (("unwind", "unwind_remaining"),
                                          ("exit", "exit_remaining")):
+                if self.live_executor is not None and phase == "exit":
+                    continue
                 order = leg.get(f"{phase}_order")
                 if (order is not None and float(leg.get(remaining_key, 0.0)) > 1e-9
                         and not order.get("wait_for_update", False)):
                     due.append(float(order["arrival"]))
-        if (state.get("entries_resolved") and float(state.get("paired_shares", 0.0)) > 1e-9
+        if (self.live_executor is None
+                and state.get("entries_resolved") and float(state.get("paired_shares", 0.0)) > 1e-9
                 and all(leg.get("exit_order") is None for leg in state["legs"])):
             if state.get("exit_mode") == "directional_ou_threshold":
                 if not state.get("exit_triggered") and state.get("max_hold_due_epoch") is not None:
@@ -1551,6 +1882,8 @@ class ShadowEngine:
         state = self.active
         if (
             self.live_executor is None or state is None
+            or self._live_exit_inflight_trade_id == int(state.get("trade_id", -1))
+            or self._live_exit_worker_running()
             or state.get("live_order_unknown")
             or not state.get("entries_resolved")
             or float(state.get("paired_shares", 0.0)) <= 1e-9
@@ -1581,6 +1914,9 @@ class ShadowEngine:
                 or float(state.get("paired_shares", 0.0)) <= 1e-9
             ):
                 return None
+            if (self._live_exit_inflight_trade_id == int(state.get("trade_id", -1))
+                    or self._live_exit_worker_running()):
+                return "LIVE EXIT pending; independent close worker owns the request"
             now = time.time()
             if not state.get("exit_triggered"):
                 due = state.get("max_hold_due_epoch")

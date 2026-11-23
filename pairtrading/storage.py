@@ -389,6 +389,46 @@ class Store:
             "SELECT 1 FROM shadow_trades WHERE market_key=? LIMIT 1", (market_key,)
         ).fetchone() is not None
 
+    def can_reenter_live_after_confirmed_no_fill(self, market_key: str) -> bool:
+        """Allow a live re-entry only when every prior attempt was conclusively unfilled."""
+        rows = self.db.execute(
+            """SELECT id,status,paired_shares,entry_legs_json,payload_json
+               FROM shadow_trades WHERE market_key=? ORDER BY id""",
+            (market_key,),
+        ).fetchall()
+        if not rows:
+            return False
+
+        for row in rows:
+            if row["status"] != "NO_POSITION" or float(row["paired_shares"] or 0.0) > 1e-9:
+                return False
+            try:
+                entry_legs = json.loads(row["entry_legs_json"] or "[]")
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                return False
+            if payload.get("live_order_unknown") or payload.get("live_position_unresolved"):
+                return False
+            if any(float(leg.get("filled_shares") or 0.0) > 1e-9 for leg in entry_legs):
+                return False
+
+            events = self.db.execute(
+                """SELECT phase,side,status,filled_shares FROM shadow_events
+                   WHERE trade_id=? AND (status='LIVE_ORDER_UNKNOWN'
+                     OR (phase='ENTRY' AND side='BUY' AND status='LIVE_FAK_NO_FILL'))""",
+                (row["id"],),
+            ).fetchall()
+            if any(event["status"] == "LIVE_ORDER_UNKNOWN" for event in events):
+                return False
+            if not any(
+                event["phase"] == "ENTRY" and event["side"] == "BUY"
+                and event["status"] == "LIVE_FAK_NO_FILL"
+                and float(event["filled_shares"] or 0.0) <= 1e-9
+                for event in events
+            ):
+                return False
+        return True
+
     def shadow_trade_rows(self) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT scenario_key,status,paired_shares,requested_shares,net_pnl,decision_epoch "

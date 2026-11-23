@@ -839,36 +839,38 @@ class ShadowEngine:
                                      "seconds_left": seconds_left},
                         )
                         break
-                    retry_max_price = _live_market_buy_max_price(
-                        book.best_ask.price, tick_size,
-                        self.settings.live_buy_max_price_ticks,
-                    )
-                    retry_amount = (
-                        None if retry_max_price is None
-                        else _live_market_buy_amount(remaining, retry_max_price)
-                    )
-                    if retry_max_price is None or retry_amount is None:
+                    assert buy_max_price is not None and market_amount_usdc is not None
+                    retry_best_ask = Decimal(str(book.best_ask.price))
+                    if not retry_best_ask.is_finite():
                         self._event(
                             state, phase, leg, side=side, status="LIVE_BUY_RETRY_SKIPPED",
                             requested=remaining, book=book, order=order,
                             details={**intent_details, "retry_count": 0,
-                                     "reason": "invalid refreshed best ask for market-buy notional",
+                                     "reason": "invalid_refreshed_best_ask",
                                      "best_ask": book.best_ask.price,
-                                     "max_price_ticks": self.settings.live_buy_max_price_ticks},
+                                     "original_max_price": format(buy_max_price, "f"),
+                                     "original_market_buy_amount_usdc": format(market_amount_usdc, "f")},
                         )
                         break
-                    prior_market_amount = market_amount_usdc
-                    market_amount_usdc = retry_amount
-                    buy_max_price = retry_max_price
+                    if retry_best_ask > buy_max_price:
+                        self._event(
+                            state, phase, leg, side=side, status="LIVE_BUY_RETRY_SKIPPED",
+                            requested=remaining, book=book, order=order,
+                            details={**intent_details, "retry_count": 0,
+                                     "reason": "refreshed_best_ask_above_original_max_price",
+                                     "retry_best_ask": format(retry_best_ask, "f"),
+                                     "original_max_price": format(buy_max_price, "f"),
+                                     "original_market_buy_amount_usdc": format(market_amount_usdc, "f")},
+                        )
+                        break
                     intent_details = {
                         **intent_details,
-                        "market_buy_amount_usdc": format(market_amount_usdc, "f"),
-                        "market_buy_max_price": format(buy_max_price, "f"),
-                        "memory_best_ask": book.best_ask.price,
-                        "book_received_at": book.received_at.timestamp(),
-                        "book_source_at": None if book.source_at is None else book.source_at.timestamp(),
-                        "book_age_ms": round(book.age_seconds(now) * 1000.0, 3),
-                        "retry_of_market_buy_amount_usdc": format(prior_market_amount, "f"),
+                        "retry_memory_best_ask": format(retry_best_ask, "f"),
+                        "retry_book_received_at": book.received_at.timestamp(),
+                        "retry_book_source_at": None if book.source_at is None else book.source_at.timestamp(),
+                        "retry_book_age_ms": round(book.age_seconds(now) * 1000.0, 3),
+                        "retry_of_market_buy_amount_usdc": format(market_amount_usdc, "f"),
+                        "retry_max_price_policy": "reuse_original_signal_cap_and_budget",
                         "attempt_number": 2,
                         "retry_reason": "explicit_fak_no_fill",
                     }

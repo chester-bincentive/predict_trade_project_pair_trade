@@ -445,7 +445,10 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                 timeout = min(1.0, until_due)
                 if remaining is not None:
                     timeout = min(timeout, remaining)
-                snapshot = await feed.capture(timeout_seconds=timeout)
+                snapshot = await feed.capture(
+                    timeout_seconds=timeout,
+                    trigger_venue="polymarket" if live_executor is not None else None,
+                )
                 if snapshot is None:
                     due = engine.next_wakeup_epoch()
                     if due is not None and due <= time.time():

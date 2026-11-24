@@ -413,6 +413,9 @@ class PairMarketFeed:
         self._binance_id_outcomes: dict[str, str] = {}
         self._binance_shared_market_id = False
         self._book_updated = asyncio.Event()
+        self._poly_book_updated = asyncio.Event()
+        self._last_poly_book_update_at: datetime | None = None
+        self._market_refresh_task: asyncio.Task[None] | None = None
         self._stream_key: tuple[str, ...] | None = None
         self._stream_tasks: tuple[asyncio.Task[None], ...] = ()
         self._active_pair: tuple[Market, Market, float] | None = None
@@ -440,6 +443,10 @@ class PairMarketFeed:
         self._stream_tasks = ()
         self._background_tasks.clear()
         self._resolution_watchers.clear()
+        if self._market_refresh_task is not None:
+            self._market_refresh_task.cancel()
+            await asyncio.gather(self._market_refresh_task, return_exceptions=True)
+            self._market_refresh_task = None
         await self.client.aclose()
 
     def current_book(self, venue: str, outcome: str) -> Book | None:
@@ -453,18 +460,47 @@ class PairMarketFeed:
     def watch_market_resolution(self, market: Market) -> None:
         self._start_resolution_watcher(market)
 
-    async def capture(self, timeout_seconds: float | None = None) -> PairSnapshot | None:
+    async def capture(self, timeout_seconds: float | None = None, *,
+                      trigger_venue: str | None = None) -> PairSnapshot | None:
+        """Capture books on any venue, or on a specific venue's update event.
+
+        Live trading uses Polymarket as the signal clock and snapshots the latest
+        Binance books received no later than that Polymarket event. Paper mode
+        keeps the existing cross-venue coalescing behavior.
+        """
+        if trigger_venue not in {None, "polymarket"}:
+            raise ValueError(f"unsupported capture trigger venue: {trigger_venue}")
+        trigger_event = self._poly_book_updated if trigger_venue == "polymarket" else self._book_updated
         deadline = None if timeout_seconds is None else time.monotonic() + max(0.0, timeout_seconds)
         while not self._closed:
             if deadline is not None and time.monotonic() >= deadline:
                 return None
             now = utc_now()
-            if (time.monotonic() - self._markets_loaded_at >= 10.0
-                    or not self._poly_markets or not self._binance_markets):
-                self._poly_markets, self._binance_markets = await asyncio.gather(
-                    self.poly.markets(now), self.binance.markets(now)
-                )
-                self._markets_loaded_at = time.monotonic()
+            # Consume a ready live signal before any periodic market-metadata work.
+            if (trigger_venue == "polymarket" and trigger_event.is_set()
+                    and self._active_pair is not None):
+                event_at = self._last_poly_book_update_at
+                self._poly_book_updated.clear()
+                if event_at is not None:
+                    snapshot = self.snapshot_at(event_at.timestamp())
+                    if snapshot is not None:
+                        return snapshot
+            if self._market_refresh_task is not None and self._market_refresh_task.done():
+                refresh_task, self._market_refresh_task = self._market_refresh_task, None
+                await refresh_task
+            refresh_due = (
+                time.monotonic() - self._markets_loaded_at >= 10.0
+                or not self._poly_markets or not self._binance_markets
+            )
+            if refresh_due:
+                if not self._poly_markets or not self._binance_markets or self._active_pair is None:
+                    # Initial discovery must finish before a pair can be streamed.
+                    await self._refresh_markets(now)
+                elif self._market_refresh_task is None:
+                    # Keep periodic REST metadata refresh off the live event path.
+                    self._market_refresh_task = asyncio.create_task(
+                        self._refresh_markets(now), name="market-metadata-refresh",
+                    )
             pair = self._select_pair(now)
             if pair is None:
                 raise FeedError(
@@ -473,7 +509,16 @@ class PairMarketFeed:
                 )
             await self._ensure_streams(*pair)
 
-            if self._book_updated.is_set():
+            if trigger_event.is_set():
+                if trigger_venue == "polymarket":
+                    event_at = self._last_poly_book_update_at
+                    self._poly_book_updated.clear()
+                    if event_at is None:
+                        continue
+                    snapshot = self.snapshot_at(event_at.timestamp())
+                    if snapshot is not None:
+                        return snapshot
+                    continue
                 # Coalesce bursts from the two venues while preserving event-driven processing.
                 coalesce_for = 0.1 if deadline is None else min(0.1, max(0.0, deadline - time.monotonic()))
                 if coalesce_for <= 0.0:
@@ -492,7 +537,7 @@ class PairMarketFeed:
             if until_deadline <= 0.0:
                 return None
             try:
-                await asyncio.wait_for(self._book_updated.wait(), timeout=min(1.0, until_refresh, until_deadline))
+                await asyncio.wait_for(trigger_event.wait(), timeout=min(1.0, until_refresh, until_deadline))
             except TimeoutError:
                 stale = [
                     f"{venue}/{outcome}={book.age_seconds(utc_now()):.2f}s"
@@ -504,6 +549,13 @@ class PairMarketFeed:
                 if deadline is not None and time.monotonic() >= deadline:
                     return None
         raise FeedError("Feed is closed")
+
+    async def _refresh_markets(self, now: datetime) -> None:
+        poly_markets, binance_markets = await asyncio.gather(
+            self.poly.markets(now), self.binance.markets(now)
+        )
+        self._poly_markets, self._binance_markets = poly_markets, binance_markets
+        self._markets_loaded_at = time.monotonic()
 
     def _select_pair(self, now: datetime) -> tuple[Market, Market, float] | None:
         pairs: list[tuple[float, Market, Market]] = []
@@ -538,6 +590,8 @@ class PairMarketFeed:
         self._poly_state.clear()
         self._binance_update_ms.clear()
         self._book_updated.clear()
+        self._poly_book_updated.clear()
+        self._last_poly_book_update_at = None
         up_id, down_id = binance_market.up_market_id, binance_market.down_market_id
         if not up_id or not down_id:
             raise FeedError("Binance market metadata is missing the outcome marketId needed for WebSocket topics")
@@ -726,6 +780,8 @@ class PairMarketFeed:
                 del self._book_history[key]
         if venue == "polymarket":
             self._poly_state.clear()
+            self._poly_book_updated.clear()
+            self._last_poly_book_update_at = None
         else:
             self._binance_update_ms.clear()
         self._book_updated.set()
@@ -905,6 +961,9 @@ class PairMarketFeed:
         self._books[key] = book
         self._remember_book(key, book)
         self._book_updated.set()
+        if venue == "polymarket":
+            self._last_poly_book_update_at = received
+            self._poly_book_updated.set()
 
     async def _run_binance(self, market: Market) -> None:
         assert market.up_market_id is not None and market.down_market_id is not None

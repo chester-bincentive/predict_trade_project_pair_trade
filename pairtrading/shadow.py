@@ -297,9 +297,9 @@ class ShadowEngine:
             return "ARRIVAL CHECK complete; signal evaluation skipped"
 
         stale = [
-            f"{venue}/{outcome}={book.age_seconds(book.received_at):.2f}s"
+            f"{venue}/{outcome}={book.age_seconds(snapshot.captured_at):.2f}s"
             for (venue, outcome), book in snapshot.books.items()
-            if book.age_seconds(book.received_at) > self.settings.max_quote_age_seconds
+            if book.age_seconds(snapshot.captured_at) > self.settings.max_quote_age_seconds
         ]
         if stale:
             return "SKIP stale quotes: " + ", ".join(stale)

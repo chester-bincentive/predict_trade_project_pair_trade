@@ -205,11 +205,11 @@ async def _run_live_exit_watchdog(
         await asyncio.sleep(min(0.25, max(0.05, settings.live_retry_interval_seconds / 4.0)))
 
 
-async def _run_live_entry_reconciliation_watchdog(
+async def _run_live_order_reconciliation_watchdog(
     engine: ShadowEngine,
     settings: Settings,
 ) -> None:
-    """Retry persisted GTC entry reconciliation without relying on market books."""
+    """Reconcile persisted GTC entries and ambiguous FAKs without market books."""
     last_error_key: str | None = None
     last_error_at = 0.0
     while True:
@@ -220,7 +220,7 @@ async def _run_live_entry_reconciliation_watchdog(
         except Exception as exc:
             error_key = type(exc).__name__
             if error_key != last_error_key or time.monotonic() - last_error_at >= 60.0:
-                print(f"LIVE ENTRY RECONCILIATION WATCHDOG ERROR ({error_key}); retrying", flush=True)
+                print(f"LIVE ORDER RECONCILIATION WATCHDOG ERROR ({error_key}); retrying", flush=True)
                 last_error_key = error_key
                 last_error_at = time.monotonic()
         else:
@@ -345,7 +345,7 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
     notifier: DiscordPnLNotifier | None = None
     notifier_task: asyncio.Task[None] | None = None
     exit_watchdog_task: asyncio.Task[None] | None = None
-    entry_watchdog_task: asyncio.Task[None] | None = None
+    order_watchdog_task: asyncio.Task[None] | None = None
     status_logger = _LiveStatusLogger()
     feed_error_logger = _FeedErrorLogger()
     if execution_mode == "live":
@@ -417,9 +417,9 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                 _run_live_exit_watchdog(engine, feed, settings),
                 name="live-polymarket-exit-watchdog",
             )
-            entry_watchdog_task = asyncio.create_task(
-                _run_live_entry_reconciliation_watchdog(engine, settings),
-                name="live-gtc-entry-reconciliation-watchdog",
+            order_watchdog_task = asyncio.create_task(
+                _run_live_order_reconciliation_watchdog(engine, settings),
+                name="live-order-reconciliation-watchdog",
             )
         if settings.discord_webhook_url:
             notifier = DiscordPnLNotifier(
@@ -509,9 +509,9 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                 await asyncio.sleep(settings.poll_seconds)
     finally:
         try:
-            if entry_watchdog_task is not None:
-                entry_watchdog_task.cancel()
-                await asyncio.gather(entry_watchdog_task, return_exceptions=True)
+            if order_watchdog_task is not None:
+                order_watchdog_task.cancel()
+                await asyncio.gather(order_watchdog_task, return_exceptions=True)
             if exit_watchdog_task is not None:
                 exit_watchdog_task.cancel()
                 await asyncio.gather(exit_watchdog_task, return_exceptions=True)

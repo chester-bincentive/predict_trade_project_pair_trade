@@ -10,6 +10,7 @@ import time
 from collections import OrderedDict
 from contextvars import ContextVar, Token
 from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_UP
 from typing import Any, Callable
 
@@ -142,6 +143,70 @@ def _field(value: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+def _event_status(value: Any) -> str:
+    """Normalize SDK enums and wire strings to their final status token."""
+    raw = getattr(value, "value", None)
+    if not isinstance(raw, str):
+        raw = getattr(value, "name", value)
+    text = str(raw or "").strip().casefold()
+    return text.rsplit(".", 1)[-1].replace(" ", "_")
+
+
+def _epoch_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    timestamp = getattr(value, "timestamp", None)
+    if callable(timestamp):
+        try:
+            return float(timestamp())
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+    text = str(value).strip()
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+    if numeric > 100_000_000_000_000_000:
+        numeric /= 1_000_000_000.0
+    elif numeric > 100_000_000_000_000:
+        numeric /= 1_000_000.0
+    elif numeric > 100_000_000_000:
+        numeric /= 1000.0
+    return numeric if math.isfinite(numeric) and numeric > 0 else None
+
+
+def _user_event_payload(event: Any) -> tuple[str, Any]:
+    """Return the canonical User WS event kind and its nested payload.
+
+    Current SDK versions wrap order/trade fields in ``event.payload``. Older
+    SDK releases exposed those fields directly, so both wire shapes remain
+    supported.
+    """
+    raw_kind = _field(event, "type", "event_type", "eventType", default="")
+    kind = _event_status(raw_kind)
+    payload = _field(event, "payload", default=None)
+    if payload is None:
+        payload = event
+    if kind.endswith("_order") or kind == "order":
+        kind = "order"
+    elif kind.endswith("_trade") or kind == "trade":
+        kind = "trade"
+    else:
+        # Some SDK wrappers keep the event kind only in the nested object.
+        nested_kind = _event_status(_field(payload, "type", "event_type", default=""))
+        if nested_kind.endswith("_order") or nested_kind == "order":
+            kind = "order"
+        elif nested_kind.endswith("_trade") or nested_kind == "trade":
+            kind = "trade"
+    return kind, payload
+
+
 def _signed_order_diagnostics(signed_order: Any, side: str) -> dict[str, Any]:
     maker_amount = _field(signed_order, "maker_amount", "makerAmount")
     taker_amount = _field(signed_order, "taker_amount", "takerAmount")
@@ -181,6 +246,7 @@ class PolymarketLiveExecutor:
     _USER_TRADE_CACHE_PER_ORDER = 64
     _USER_STREAM_RECONNECT_MAX_SECONDS = 30.0
     _GTC_REST_CALL_TIMEOUT_SECONDS = 4.0
+    _ORDER_POST_TIMEOUT_SECONDS = 8.0
 
     def __init__(self, fee_rate: float) -> None:
         self.fee_rate = float(fee_rate)
@@ -209,6 +275,8 @@ class PolymarketLiveExecutor:
         self._user_order_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._user_trade_rows: OrderedDict[str, OrderedDict[str, dict[str, Any]]] = OrderedDict()
         self._tracked_gtc_orders: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._user_order_intents: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._resolved_user_order_intents: OrderedDict[str, str] = OrderedDict()
 
     async def connect(self) -> None:
         from polymarket import AsyncSecureClient, RelayerApiKey
@@ -266,9 +334,9 @@ class PolymarketLiveExecutor:
         if not order_id:
             return
         state = dict(self._user_order_states.get(order_id, {}))
-        status = str(_field(payload, "status", default="") or "").lower()
+        status = _event_status(_field(payload, "status", default=""))
         terminal = {"matched", "filled", "canceled", "cancelled", "expired"}
-        old_status = str(state.get("status", "")).lower()
+        old_status = _event_status(state.get("status", ""))
         if status and not (old_status in terminal and status not in terminal):
             state["status"] = status
         raw = _field(payload, "size_matched", "sizeMatched")
@@ -284,7 +352,7 @@ class PolymarketLiveExecutor:
             except (InvalidOperation, TypeError, ValueError):
                 pass
         if source == "USER_WS" and status:
-            old_ws_status = str(state.get("user_ws_status", "")).lower()
+            old_ws_status = _event_status(state.get("user_ws_status", ""))
             if not (old_ws_status in terminal and status not in terminal):
                 state["user_ws_status"] = status
         state["source"] = source
@@ -293,6 +361,166 @@ class PolymarketLiveExecutor:
         while len(self._user_order_states) > self._USER_EVENT_CACHE_LIMIT:
             self._user_order_states.popitem(last=False)
         self._user_state_changed.set()
+
+    def register_user_order_intent(
+        self, intent_key: str, *, asset_id: str, condition_id: str,
+        side: str, requested_qty: float, price: Any, intent_epoch: float,
+    ) -> None:
+        if not intent_key:
+            return
+        self._user_order_intents[intent_key] = {
+            "asset_id": str(asset_id), "condition_id": str(condition_id).lower(),
+            "side": str(side).upper(), "requested_qty": str(requested_qty),
+            "price": str(price), "intent_epoch": float(intent_epoch),
+        }
+        self._user_order_intents.move_to_end(intent_key)
+        while len(self._user_order_intents) > self._USER_EVENT_CACHE_LIMIT:
+            self._user_order_intents.popitem(last=False)
+
+    def resolved_user_order_intent(self, intent_key: str) -> str | None:
+        order_id = self._resolved_user_order_intents.get(str(intent_key))
+        if order_id is not None:
+            self._resolved_user_order_intents.move_to_end(str(intent_key))
+        return order_id
+
+    def forget_user_order_intent(self, intent_key: str) -> None:
+        key = str(intent_key or "")
+        if not key:
+            return
+        self._user_order_intents.pop(key, None)
+        self._resolved_user_order_intents.pop(key, None)
+
+    def _associate_user_order_intent(self, order_id: str, payload: Any) -> None:
+        asset_id = str(_field(payload, "asset_id", "assetId", "token_id", "tokenId", default="") or "")
+        condition_id = str(_field(payload, "market", "condition_id", "conditionId", default="") or "").lower()
+        side = _event_status(_field(payload, "side", default="")).upper()
+        raw_size = _field(payload, "original_size", "originalSize", "size", default=None)
+        raw_price = _field(payload, "price", default=None)
+        created_epoch = _epoch_seconds(_field(
+            payload, "created_at", "createdAt", "timestamp", default=None,
+        ))
+        if not asset_id or side not in {"BUY", "SELL"} or raw_size is None or raw_price is None:
+            return
+        try:
+            size = Decimal(str(raw_size))
+            price = Decimal(str(raw_price))
+        except (InvalidOperation, TypeError, ValueError):
+            return
+        matches = []
+        for intent_key, intent in self._user_order_intents.items():
+            if asset_id != intent["asset_id"] or side != intent["side"]:
+                continue
+            if condition_id and condition_id != intent["condition_id"]:
+                continue
+            try:
+                expected_size = Decimal(intent["requested_qty"])
+                expected_price = Decimal(intent["price"])
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if (abs(size - expected_size) > Decimal("0.0001")
+                    or abs(price - expected_price) > Decimal("0.000001")):
+                continue
+            if (created_epoch is not None
+                    and abs(created_epoch - float(intent["intent_epoch"])) > 180.0):
+                continue
+            matches.append(intent_key)
+        if len(matches) != 1:
+            return
+        intent_key = matches[0]
+        self._resolved_user_order_intents[intent_key] = str(order_id)
+        self._resolved_user_order_intents.move_to_end(intent_key)
+        while len(self._resolved_user_order_intents) > self._USER_EVENT_CACHE_LIMIT:
+            old_key, _ = self._resolved_user_order_intents.popitem(last=False)
+            self._user_order_intents.pop(old_key, None)
+
+    async def find_open_order_for_intent(
+        self, *, asset_id: str, condition_id: str, side: str,
+        requested_qty: float, price: Any, intent_epoch: float,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Find a unique matching open order after a POST reply was lost."""
+        if self.client is None:
+            raise LiveOrderUnknown("Polymarket account is disconnected during order-intent lookup")
+
+        async def collect() -> list[Any]:
+            rows = []
+            async for item in self.client.list_open_orders(
+                asset_id=asset_id, market=condition_id,
+            ).iter_items():
+                rows.append(item)
+            return rows
+
+        task = asyncio.ensure_future(collect())
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self._GTC_REST_CALL_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(lambda item: None if item.cancelled() else item.exception())
+            raise
+        if not done:
+            task.cancel()
+            task.add_done_callback(lambda item: None if item.cancelled() else item.exception())
+            raise asyncio.TimeoutError("open-order intent lookup exceeded the REST timeout")
+        candidates = []
+        expected_size = Decimal(str(requested_qty))
+        expected_price = Decimal(str(price))
+        for row in task.result():
+            oid = str(_field(row, "id", "order_id", "orderId", default="") or "")
+            row_asset = str(_field(row, "asset_id", "assetId", "token_id", "tokenId", default="") or "")
+            row_market = str(_field(row, "market", "condition_id", "conditionId", default="") or "").lower()
+            row_side = _event_status(_field(row, "side", default="")).upper()
+            try:
+                size = Decimal(str(_field(row, "original_size", "originalSize", "size", default="")))
+                row_price = Decimal(str(_field(row, "price", default="")))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            created_epoch = _epoch_seconds(_field(
+                row, "created_at", "createdAt", "timestamp", default=None,
+            ))
+            if (not oid or row_asset != str(asset_id) or row_side != str(side).upper()
+                    or (row_market and row_market != str(condition_id).lower())
+                    or abs(size - expected_size) > Decimal("0.0001")
+                    or abs(row_price - expected_price) > Decimal("0.000001")
+                    or (created_epoch is not None and abs(created_epoch - float(intent_epoch)) > 180.0)):
+                continue
+            candidates.append(oid)
+        candidates = sorted(set(candidates))
+        if len(candidates) > 1:
+            raise LiveOrderUnknown(
+                "multiple open orders match the persisted order intent",
+                diagnostic_fields={"candidate_count": len(candidates),
+                                   "candidate_order_ids": candidates[:5]},
+            )
+        if not candidates:
+            return None, {"candidate_count": 0, "lookup_source": "REST_OPEN_ORDERS"}
+        return candidates[0], {"candidate_count": 1, "lookup_source": "REST_OPEN_ORDERS"}
+
+    async def _post_order_with_timeout(self, signed_order: Any) -> Any:
+        """Bound the caller wait without waiting for cancellation-resistant SDK I/O."""
+        if self.client is None:
+            raise RuntimeError("Polymarket account is disconnected")
+        task = asyncio.ensure_future(self.client.post_order(signed_order))
+
+        def consume_late_result(done_task: asyncio.Future[Any]) -> None:
+            if done_task.cancelled():
+                return
+            try:
+                done_task.exception()
+            except Exception:
+                pass
+
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self._ORDER_POST_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(consume_late_result)
+            raise
+        if not done:
+            task.cancel()
+            task.add_done_callback(consume_late_result)
+            raise asyncio.TimeoutError(
+                f"Polymarket POST /order exceeded {self._ORDER_POST_TIMEOUT_SECONDS:.1f}s"
+            )
+        return task.result()
 
     def _remember_user_trade(self, order_id: str, trade_id: str, size: Any,
                              price: Any, status: str, source: str) -> None:
@@ -305,7 +533,7 @@ class PolymarketLiveExecutor:
         if not (qty.is_finite() and qty > 0 and px.is_finite() and px > 0):
             return
         trades = self._user_trade_rows.setdefault(order_id, OrderedDict())
-        status = str(status or "").upper()
+        status = _event_status(status).upper()
         previous = trades.get(trade_id, {})
         previous_status = str(previous.get("status", "")).upper()
         terminal_statuses = {"FAILED", "MINED", "CONFIRMED"}
@@ -332,20 +560,21 @@ class PolymarketLiveExecutor:
         return rows
 
     async def _record_user_event(self, event: Any) -> None:
-        kind = str(_field(event, "event_type", "eventType", "type", default="") or "").lower()
+        kind, payload = _user_event_payload(event)
         if kind == "order":
-            oid = str(_field(event, "id", "order_id", "orderId", default="") or "")
-            self._remember_user_order(oid, event, "USER_WS")
+            oid = str(_field(payload, "id", "order_id", "orderId", default="") or "")
+            self._remember_user_order(oid, payload, "USER_WS")
+            self._associate_user_order_intent(oid, payload)
             return
         if kind != "trade":
             return
-        tid = str(_field(event, "id", "trade_id", "tradeId", default="") or "")
-        status = str(_field(event, "status", default="") or "").upper()
-        size, price = _field(event, "size", "amount"), _field(event, "price")
-        taker = str(_field(event, "taker_order_id", "takerOrderId", default="") or "")
+        tid = str(_field(payload, "id", "trade_id", "tradeId", default="") or "")
+        status = _event_status(_field(payload, "status", default="")).upper()
+        size, price = _field(payload, "size", "amount"), _field(payload, "price")
+        taker = str(_field(payload, "taker_order_id", "takerOrderId", default="") or "")
         if taker:
             self._remember_user_trade(taker, tid, size, price, status, "USER_WS")
-        for maker in (_field(event, "maker_orders", "makerOrders", default=()) or ()):
+        for maker in (_field(payload, "maker_orders", "makerOrders", default=()) or ()):
             oid = str(_field(maker, "order_id", "orderId", default="") or "")
             qty = _field(maker, "matched_amount", "matchedAmount", "size")
             if oid:
@@ -358,7 +587,8 @@ class PolymarketLiveExecutor:
         paginator = self.client.list_account_trades(asset_id=asset_id, market=condition_id)
         rows = {}
         async for trade in paginator.iter_items():
-            if str(_field(trade, "status", default="") or "").upper() == "FAILED":
+            trade_status = _event_status(_field(trade, "status", default="")).upper()
+            if trade_status == "FAILED":
                 continue
             tid = str(_field(trade, "id", "trade_id", "tradeId", default="") or "")
             taker = str(_field(trade, "taker_order_id", "takerOrderId", default="") or "")
@@ -378,7 +608,7 @@ class PolymarketLiveExecutor:
                 continue
             if not tid:
                 continue
-            rows[tid] = (tid, size, price, str(_field(trade, "status", default="") or "").upper())
+            rows[tid] = (tid, size, price, trade_status)
         return rows
 
     async def _reconcile_user_stream_gap(self) -> None:
@@ -443,7 +673,7 @@ class PolymarketLiveExecutor:
         while True:
             self._user_state_changed.clear()
             state = self._user_order_states.get(order_id, {})
-            status = str(state.get("user_ws_status", "")).lower()
+            status = _event_status(state.get("user_ws_status", ""))
             try:
                 matched = Decimal(str(state.get("user_ws_size_matched", "-1")))
             except (InvalidOperation, TypeError, ValueError):
@@ -1337,7 +1567,7 @@ class PolymarketLiveExecutor:
             timing_context["order_prepare_source"] = source
         try:
             post_started_ns = time.perf_counter_ns()
-            response = await self.client.post_order(signed_order)
+            response = await self._post_order_with_timeout(signed_order)
             trace["sdk_post_order_call_ms"] = (
                 time.perf_counter_ns() - post_started_ns
             ) / 1_000_000.0
@@ -1372,7 +1602,7 @@ class PolymarketLiveExecutor:
             ) from exc
 
         order_id = _field(response, "order_id", "orderId", "id")
-        status = str(_field(response, "status", default="unknown") or "unknown").lower()
+        status = _event_status(_field(response, "status", default="unknown")) or "unknown"
         accepted = bool(_field(response, "ok", "success", default=False)) or order_id is not None
         returned_trade_ids = [
             str(item) for item in (_field(response, "trade_ids", "tradeIds", default=()) or ())
@@ -1481,16 +1711,16 @@ class PolymarketLiveExecutor:
         context = self._tracked_gtc_orders.setdefault(order_id, {})
         context.update({"asset_id": asset_id, "condition_id": condition_id,
                         "requested_qty": Decimal(str(requested_qty))})
-        post_status = str(
+        post_status = _event_status(
             post_order_status or context.get("post_order_status", "") or ""
-        ).lower()
+        )
         context["post_order_status"] = post_status
         # The POST acknowledgement's matched state is retained as a hint only.
         # Do not turn it into a User WebSocket event or use it as fill evidence.
         report("user_ws_wait", "started", wait_seconds=wait_seconds)
         await self._wait_gtc_fill_or_timeout(order_id, requested_qty, wait_seconds)
         ws = dict(self._user_order_states.get(order_id, {}))
-        ws_status = str(ws.get("user_ws_status", "") or "").lower()
+        ws_status = _event_status(ws.get("user_ws_status", ""))
         try:
             ws_qty = Decimal(str(ws.get("user_ws_size_matched")))
             if not ws_qty.is_finite() or ws_qty < 0:
@@ -1549,7 +1779,7 @@ class PolymarketLiveExecutor:
                     lambda: self.client.get_order(order_id=order_id),
                 )
                 order_error = None
-                observed_status = str(_field(order_state, "status", default="") or "").lower()
+                observed_status = _event_status(_field(order_state, "status", default=""))
                 report("get_order", "observed", attempt=attempt,
                        order_status=observed_status or None,
                        size_matched=_field(order_state, "size_matched", "sizeMatched"))
@@ -1575,7 +1805,7 @@ class PolymarketLiveExecutor:
             if attempt < 3:
                 await asyncio.sleep(0.15 * attempt)
 
-        rest_status = str(_field(order_state, "status", default="") or "").lower() if order_state is not None else ""
+        rest_status = _event_status(_field(order_state, "status", default="")) if order_state is not None else ""
         raw_rest_qty = _field(order_state, "size_matched", "sizeMatched") if order_state is not None else None
         try:
             rest_qty = Decimal(str(raw_rest_qty))
@@ -1645,7 +1875,7 @@ class PolymarketLiveExecutor:
 
         total = sum((row[1] for row in rows.values()), Decimal("0"))
         latest_ws = dict(self._user_order_states.get(order_id, {}))
-        latest_ws_status = str(latest_ws.get("user_ws_status", "") or "").lower()
+        latest_ws_status = _event_status(latest_ws.get("user_ws_status", ""))
         status = (
             rest_status if rest_status in terminal
             else latest_ws_status if latest_ws_status in terminal
@@ -1738,6 +1968,196 @@ class PolymarketLiveExecutor:
                                                   for item in self._user_trade_rows.get(order_id, {}).values())),
                       "order_status_inferred_from_confirmed_trades": inferred_terminal_from_trades,
                       "fill_source": "REST_ACCOUNT_TRADES" if rest_rows_found else "USER_WS_CONFIRMED_TRADE"}
+
+    async def reconcile_fak_order(
+        self, *, order_id: str, asset_id: str, condition_id: str,
+        side: str, requested_qty: float,
+        progress_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
+    ) -> tuple[Fill | None, dict[str, Any]]:
+        """Reconcile an ambiguous FAK from its terminal order and account trades.
+
+        An empty trade page alone is never treated as a zero fill. A zero result
+        requires an explicitly terminal, zero-matched order; positive fills must
+        agree with the order's matched-size hint or be confirmed by trade state.
+        """
+        if self.client is None:
+            raise LiveOrderUnknown(
+                "Polymarket account is not connected during FAK reconciliation",
+                diagnostic_fields={"order_id": order_id},
+            )
+
+        def report(step: str, outcome: str, **fields: Any) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(step, outcome, fields)
+            except Exception as exc:
+                logger.warning("LIVE_FAK_PROGRESS_CALLBACK_FAILED step=%s error_type=%s",
+                               step, type(exc).__name__)
+
+        async def bounded(step: str, call: Callable[[], Any]) -> Any:
+            started = time.monotonic()
+            report(step, "started", timeout_seconds=self._GTC_REST_CALL_TIMEOUT_SECONDS)
+            task: asyncio.Future[Any] | None = None
+            try:
+                operation = call()
+                if not inspect.isawaitable(operation):
+                    result = operation
+                else:
+                    task = asyncio.ensure_future(operation)
+                    done, _ = await asyncio.wait(
+                        {task}, timeout=self._GTC_REST_CALL_TIMEOUT_SECONDS,
+                    )
+                    if not done:
+                        task.cancel()
+                        task.add_done_callback(
+                            lambda item: None if item.cancelled() else item.exception()
+                        )
+                        raise asyncio.TimeoutError(f"{step} exceeded the REST timeout")
+                    result = task.result()
+            except asyncio.CancelledError:
+                if task is not None and not task.done():
+                    task.cancel()
+                report(step, "cancelled",
+                       elapsed_ms=round((time.monotonic() - started) * 1000.0, 3))
+                raise
+            except Exception as exc:
+                report(step, "error", error_type=type(exc).__name__,
+                       error=_safe_diagnostic_text(exc),
+                       elapsed_ms=round((time.monotonic() - started) * 1000.0, 3))
+                raise
+            report(step, "completed",
+                   elapsed_ms=round((time.monotonic() - started) * 1000.0, 3))
+            return result
+
+        order_state = None
+        order_error = None
+        try:
+            order_state = await bounded(
+                "get_order", lambda: self.client.get_order(order_id=order_id),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            order_error = f"{type(exc).__name__}: {_safe_diagnostic_text(exc)}"
+
+        rest_status = _event_status(_field(order_state, "status", default=""))
+        if rest_status in {"live", "open", "unmatched", "delayed"}:
+            try:
+                await bounded("cancel_order", lambda: self.client.cancel_order(order_id=order_id))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                order_error = f"{type(exc).__name__}: {_safe_diagnostic_text(exc)}"
+            else:
+                try:
+                    order_state = await bounded(
+                        "get_order_after_cancel",
+                        lambda: self.client.get_order(order_id=order_id),
+                    )
+                    rest_status = _event_status(_field(order_state, "status", default=""))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    order_error = f"{type(exc).__name__}: {_safe_diagnostic_text(exc)}"
+
+        trade_error = None
+        try:
+            rows = await bounded(
+                "account_trades",
+                lambda: self._fetch_account_trade_rows(order_id, asset_id, condition_id),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            rows = {}
+            trade_error = f"{type(exc).__name__}: {_safe_diagnostic_text(exc)}"
+        for trade_id, qty, price, status in rows.values():
+            self._remember_user_trade(order_id, trade_id, qty, price, status, "REST")
+        cached_trades = self._cached_user_trades(order_id)
+        cached_trades.update(rows)
+        rows = cached_trades
+
+        ws = dict(self._user_order_states.get(order_id, {}))
+        rest_status = _event_status(_field(order_state, "status", default=""))
+        ws_status = _event_status(ws.get("user_ws_status", ""))
+        terminal_statuses = {"matched", "filled", "canceled", "cancelled", "expired"}
+        status = (
+            rest_status if rest_status in terminal_statuses
+            else ws_status if ws_status in terminal_statuses
+            else rest_status or ws_status
+        )
+        raw_rest_qty = _field(order_state, "size_matched", "sizeMatched")
+        qty_hints: list[Decimal] = []
+        for raw in (raw_rest_qty, ws.get("user_ws_size_matched")):
+            try:
+                value = Decimal(str(raw))
+                if value.is_finite() and value >= 0:
+                    qty_hints.append(value)
+            except (InvalidOperation, TypeError, ValueError):
+                pass
+        matched_hint = max(qty_hints) if qty_hints else None
+        total = sum((row[1] for row in rows.values()), Decimal("0"))
+        trade_statuses = {str(row[3]).upper() for row in rows.values()}
+        details = {
+            "order_id": order_id, "order_status": status or None,
+            "rest_order_status": rest_status or None,
+            "user_ws_order_status": ws_status or None,
+            "size_matched": None if matched_hint is None else format(matched_hint, "f"),
+            "trade_count": len(rows), "trade_size_matched": format(total, "f"),
+            "trade_ids": sorted(rows),
+            "trade_statuses": sorted(trade_statuses),
+            "order_query_error": order_error, "trade_query_error": trade_error,
+        }
+        terminal_zero = (
+            status in {"canceled", "cancelled", "expired"}
+            and (matched_hint is None or matched_hint <= Decimal("0.000001"))
+            and total <= Decimal("0.000001")
+            and trade_error is None
+        )
+        if terminal_zero:
+            return None, {**details, "confirmed_zero_fill": True}
+
+        if total > Decimal("0.000001"):
+            quantity_agrees = (
+                matched_hint is not None
+                and abs(total - matched_hint) <= Decimal("0.0001")
+            )
+            trades_final = bool(trade_statuses) and trade_statuses.issubset(
+                {"MINED", "CONFIRMED"}
+            )
+            order_terminal = status in {"matched", "filled", "canceled", "cancelled", "expired"}
+            if quantity_agrees or trades_final or order_terminal:
+                if total > Decimal(str(requested_qty)) + Decimal("0.0001"):
+                    raise LiveOrderUnknown(
+                        "FAK account trades exceed the requested quantity",
+                        diagnostic_fields=details,
+                    )
+                notional = sum((qty * px for _, qty, px, _ in rows.values()), Decimal("0"))
+                filled = float(total)
+                value = float(notional)
+                vwap = value / filled
+                if not (math.isfinite(vwap) and 0 < vwap < 1):
+                    raise LiveOrderUnknown(
+                        "FAK account trades returned an invalid VWAP",
+                        diagnostic_fields={**details, "vwap": vwap},
+                    )
+                fee = filled * self.fee_rate * vwap * (1.0 - vwap)
+                fill = Fill(
+                    requested_qty=requested_qty, filled_qty=filled,
+                    notional=value, fee=fee, vwap=vwap,
+                    levels=tuple(
+                        {"price": float(px), "available_size": float(qty), "filled_size": float(qty)}
+                        for _, qty, px, _ in rows.values()
+                    ),
+                )
+                return fill, {**details, "confirmed_zero_fill": False,
+                              "fill_source": "REST_ACCOUNT_TRADES"}
+
+        raise LiveOrderUnknown(
+            f"FAK order is still awaiting authoritative reconciliation order_id={order_id}",
+            diagnostic_fields=details,
+        )
 
     async def buy_fak(
         self,
@@ -1956,7 +2376,7 @@ class PolymarketLiveExecutor:
                 self._export_order_timing(trace)
         try:
             post_order_started_ns = time.perf_counter_ns()
-            response = await self.client.post_order(fak_order)
+            response = await self._post_order_with_timeout(fak_order)
             trace["sdk_post_order_call_ms"] = (
                 time.perf_counter_ns() - post_order_started_ns
             ) / 1_000_000.0
@@ -2025,7 +2445,7 @@ class PolymarketLiveExecutor:
 
         accepted = bool(_field(response, "ok", default=False))
         order_id = _field(response, "order_id", "orderId")
-        status = str(_field(response, "status", default="unknown")).lower()
+        status = _event_status(_field(response, "status", default="unknown"))
         details = {
             "order_id": str(order_id) if order_id is not None else None,
             "order_status": status,

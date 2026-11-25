@@ -100,7 +100,7 @@ class LiveGtcSimulationTests(unittest.IsolatedAsyncioTestCase):
 
         accepted, order_id, details = await executor.buy_gtc_limit(
             asset_id="yes-token", requested_qty=5, limit_price=limit_price,
-            tick_size="0.01",
+            tick_size="0.01", condition_id="test-condition",
         )
 
         self.assertTrue(accepted)
@@ -137,7 +137,7 @@ class LiveGtcSimulationTests(unittest.IsolatedAsyncioTestCase):
 
         accepted, order_id, _ = await executor.buy_gtc_limit(
             asset_id="yes-token", requested_qty=5, limit_price=limit_price,
-            tick_size="0.01",
+            tick_size="0.01", condition_id="test-condition",
         )
         self.assertTrue(accepted)
         self.assertEqual(market["ask"], Decimal("0.51"))
@@ -158,7 +158,7 @@ class LiveGtcSimulationTests(unittest.IsolatedAsyncioTestCase):
         limit_price = Decimal("0.55")
         accepted, order_id, _ = await executor.buy_gtc_limit(
             asset_id="yes-token", requested_qty=5, limit_price=limit_price,
-            tick_size="0.01",
+            tick_size="0.01", condition_id="test-condition",
         )
         self.assertTrue(accepted)
         client.size_matched = "2"
@@ -187,8 +187,8 @@ class LiveGtcSimulationTests(unittest.IsolatedAsyncioTestCase):
                 order_id=client.order_id, asset_id="yes-token",
                 condition_id="test-condition", requested_qty=5, wait_seconds=0,
             )
-        self.assertEqual(client.get_calls, 2)
-        self.assertEqual(client.cancel_calls, 2)
+        self.assertEqual(client.get_calls, 3)
+        self.assertEqual(client.cancel_calls, 3)
 
     def test_limit_price_respects_market_tick_ceiling(self) -> None:
         self.assertEqual(_live_buy_limit_price(0.96, "0.01", 3), Decimal("0.99"))

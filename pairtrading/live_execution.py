@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import logging
 import math
@@ -15,6 +16,7 @@ from decimal import Decimal, InvalidOperation, ROUND_UP
 from typing import Any, Callable
 
 from .credstore_bridge import fetch_private_key
+from .live_cancel_worker import LiveGtcCancelWorker
 from .models import Fill, Market
 
 logger = logging.getLogger(__name__)
@@ -277,6 +279,10 @@ class PolymarketLiveExecutor:
         self._tracked_gtc_orders: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._user_order_intents: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._resolved_user_order_intents: OrderedDict[str, str] = OrderedDict()
+        self._gtc_cancel_worker: LiveGtcCancelWorker | None = None
+        self._gtc_cancel_futures: dict[
+            str, concurrent.futures.Future[dict[str, Any]]
+        ] = {}
 
     async def connect(self) -> None:
         from polymarket import AsyncSecureClient, RelayerApiKey
@@ -315,6 +321,18 @@ class PolymarketLiveExecutor:
         )
         self._client_context = context
         self.client = await context.__aenter__()
+        cancel_worker = LiveGtcCancelWorker(
+            private_key=private_key,
+            wallet=wallet,
+            relayer_key=relayer_key,
+            relayer_address=relayer_address,
+        )
+        self._gtc_cancel_worker = cancel_worker
+        try:
+            await cancel_worker.start()
+        except Exception:
+            await self.close()
+            raise
         self._install_http_timing_hooks()
         self._http_keepalive_task = asyncio.create_task(
             self._keep_order_http_connection_alive(),
@@ -578,7 +596,8 @@ class PolymarketLiveExecutor:
             oid = str(_field(maker, "order_id", "orderId", default="") or "")
             qty = _field(maker, "matched_amount", "matchedAmount", "size")
             if oid:
-                self._remember_user_trade(oid, tid, qty, price, status, "USER_WS")
+                maker_price = _field(maker, "price", default=price)
+                self._remember_user_trade(oid, tid, qty, maker_price, status, "USER_WS")
 
     async def _fetch_account_trade_rows(self, order_id: str, asset_id: str,
                                         condition_id: str) -> dict[str, tuple[str, Decimal, Decimal, str]]:
@@ -593,15 +612,17 @@ class PolymarketLiveExecutor:
             tid = str(_field(trade, "id", "trade_id", "tradeId", default="") or "")
             taker = str(_field(trade, "taker_order_id", "takerOrderId", default="") or "")
             qty = _field(trade, "size", "amount") if taker == order_id else None
+            trade_price = _field(trade, "price")
             if qty is None:
                 for maker in (_field(trade, "maker_orders", "makerOrders", default=()) or ()):
                     if str(_field(maker, "order_id", "orderId", default="") or "") == order_id:
                         qty = _field(maker, "matched_amount", "matchedAmount", "size")
+                        trade_price = _field(maker, "price", default=trade_price)
                         break
             if qty is None:
                 continue
             try:
-                size, price = Decimal(str(qty)), Decimal(str(_field(trade, "price")))
+                size, price = Decimal(str(qty)), Decimal(str(trade_price))
             except (InvalidOperation, TypeError, ValueError):
                 continue
             if not (size.is_finite() and size > 0 and price.is_finite() and price > 0):
@@ -667,9 +688,20 @@ class PolymarketLiveExecutor:
                 self._user_stream_connected = False
 
     async def _wait_gtc_fill_or_timeout(self, order_id: str,
-                                        requested_qty: float, seconds: float) -> None:
+                                        requested_qty: float, seconds: float) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
+        started = loop.time()
         deadline = loop.time() + max(0.0, float(seconds))
+
+        def result(trigger: str) -> dict[str, Any]:
+            completed = loop.time()
+            return {
+                "wait_trigger": trigger,
+                "wait_elapsed_ms": round((completed - started) * 1000.0, 3),
+                "wait_deadline_lateness_ms": round(max(0.0, completed - deadline) * 1000.0, 3),
+                "wait_seconds": max(0.0, float(seconds)),
+            }
+
         while True:
             self._user_state_changed.clear()
             state = self._user_order_states.get(order_id, {})
@@ -687,14 +719,93 @@ class PolymarketLiveExecutor:
             if (status in {"matched", "filled"}
                     or matched >= Decimal(str(requested_qty)) - Decimal("0.0001")
                     or ws_trade_qty > 0):
-                return
+                return result("user_ws_update")
             remaining = deadline - loop.time()
             if remaining <= 0:
-                return
+                return result("deadline")
             try:
                 await asyncio.wait_for(self._user_state_changed.wait(), remaining)
             except asyncio.TimeoutError:
-                return
+                return result("deadline")
+
+    def schedule_gtc_cancel_deadline(
+        self, order_id: str, deadline_epoch: float,
+    ) -> concurrent.futures.Future[dict[str, Any]]:
+        worker = self._gtc_cancel_worker
+        if worker is None:
+            raise RuntimeError("independent GTC cancel worker is unavailable")
+        key = str(order_id)
+        retry_round = self._gtc_cancel_retry_round(key)
+        future = worker.schedule_cancel(key, deadline_epoch, retry_round=retry_round)
+        self._gtc_cancel_futures[key] = future
+        return future
+
+    def request_gtc_cancel_now(
+        self, order_id: str,
+    ) -> concurrent.futures.Future[dict[str, Any]]:
+        key = str(order_id)
+        existing = self._gtc_cancel_futures.get(key)
+        if existing is not None and existing.done() and not existing.cancelled():
+            try:
+                if (existing.exception() is None
+                        and (not isinstance(existing.result(), dict)
+                             or existing.result().get("outcome") != "retry_scheduled")):
+                    return existing
+            except concurrent.futures.CancelledError:
+                pass
+        worker = self._gtc_cancel_worker
+        if worker is None:
+            raise RuntimeError("independent GTC cancel worker is unavailable")
+        future = worker.cancel_now(key, retry_round=self._gtc_cancel_retry_round(key))
+        self._gtc_cancel_futures[key] = future
+        return future
+
+    def _gtc_cancel_retry_round(self, order_id: str) -> int:
+        future = self._gtc_cancel_futures.get(order_id)
+        if future is None or not future.done() or future.cancelled():
+            return 0
+        try:
+            result = future.result()
+        except Exception:
+            return 0
+        if not isinstance(result, dict) or result.get("outcome") != "retry_scheduled":
+            return 0
+        try:
+            return max(0, int(result.get("retry_round", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    async def forget_gtc_cancel(self, order_id: str) -> None:
+        key = str(order_id)
+        worker = self._gtc_cancel_worker
+        if worker is not None:
+            try:
+                disarm = worker.disarm(key)
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.wrap_future(disarm)), timeout=1.0,
+                )
+            except Exception as exc:
+                logger.warning("LIVE_GTC_CANCEL_DEADLINE_DISARM_FAILED error_type=%s",
+                               type(exc).__name__)
+        self._gtc_cancel_futures.pop(key, None)
+
+    def has_gtc_cancel(self, order_id: str) -> bool:
+        future = self._gtc_cancel_futures.get(str(order_id))
+        if future is None:
+            return False
+        if not future.done():
+            return True
+        if future.cancelled():
+            return False
+        try:
+            if future.exception() is not None:
+                return False
+            result = future.result()
+            if isinstance(result, dict) and result.get("outcome") == "retry_scheduled":
+                return time.time() < float(result.get("next_retry_epoch") or 0.0)
+            return True
+        except concurrent.futures.CancelledError:
+            return False
 
     def _install_http_timing_hooks(self) -> None:
         """Attach lightweight hooks to the SDK's existing HTTP/2 clients."""
@@ -1293,6 +1404,25 @@ class PolymarketLiveExecutor:
         )
 
     async def close(self) -> None:
+        cancel_worker, self._gtc_cancel_worker = self._gtc_cancel_worker, None
+        if cancel_worker is not None:
+            try:
+                for order_id, future in list(self._gtc_cancel_futures.items()):
+                    if not future.done() or future.cancelled():
+                        continue
+                    try:
+                        result = future.result()
+                    except Exception:
+                        continue
+                    if isinstance(result, dict) and result.get("outcome") == "retry_scheduled":
+                        cancel_worker.schedule_cancel(
+                            order_id, time.time(),
+                            retry_round=self._gtc_cancel_retry_round(order_id),
+                        )
+                await cancel_worker.close()
+            except Exception as exc:
+                logger.warning("LIVE_GTC_CANCEL_WORKER_CLOSE_FAILED error_type=%s",
+                               type(exc).__name__)
         user_task = self._user_stream_task
         self._user_stream_task = None
         if user_task is not None:
@@ -1718,7 +1848,7 @@ class PolymarketLiveExecutor:
         # The POST acknowledgement's matched state is retained as a hint only.
         # Do not turn it into a User WebSocket event or use it as fill evidence.
         report("user_ws_wait", "started", wait_seconds=wait_seconds)
-        await self._wait_gtc_fill_or_timeout(order_id, requested_qty, wait_seconds)
+        wait_details = await self._wait_gtc_fill_or_timeout(order_id, requested_qty, wait_seconds)
         ws = dict(self._user_order_states.get(order_id, {}))
         ws_status = _event_status(ws.get("user_ws_status", ""))
         try:
@@ -1737,7 +1867,8 @@ class PolymarketLiveExecutor:
             1 for item in self._user_trade_rows.get(order_id, {}).values()
             if item.get("source") == "USER_WS"
         )
-        report("user_ws_wait", "completed", order_status=ws_status or None,
+        report("user_ws_wait", "completed", **wait_details,
+               order_status=ws_status or None,
                size_matched=ws.get("user_ws_size_matched"),
                ws_source="USER_WS" if ws_status or ws.get("user_ws_size_matched") is not None or ws_trade_count else None,
                ws_trade_count=ws_trade_count,
@@ -1753,9 +1884,18 @@ class PolymarketLiveExecutor:
         not_canceled: Any = {}
         if not matched_hint:
             try:
+                if ws_trade_qty > 0:
+                    # A partial User WS fill ends the wait early; cancel the remainder
+                    # immediately on the isolated cancellation loop.
+                    self.request_gtc_cancel_now(order_id)
+                cancel_future = self._gtc_cancel_futures.get(order_id)
+                cancel_call: Callable[[], Any]
+                if cancel_future is not None:
+                    cancel_call = lambda: asyncio.shield(asyncio.wrap_future(cancel_future))
+                else:
+                    cancel_call = lambda: self.client.cancel_order(order_id=order_id)
                 response = await timed_call(
-                    "cancel_order", 1,
-                    lambda: self.client.cancel_order(order_id=order_id),
+                    "cancel_order", 1, cancel_call,
                 )
                 canceled = _field(response, "canceled", default=()) or ()
                 not_canceled = _field(response, "not_canceled", "notCanceled", default={}) or {}
@@ -1763,7 +1903,16 @@ class PolymarketLiveExecutor:
                 report("cancel_order", "observed", attempt=1,
                        cancellation_confirmed=cancellation_confirmed,
                        canceled_order_count=len(canceled),
-                       not_canceled_count=len(not_canceled))
+                       not_canceled_count=len(not_canceled),
+                       cancel_worker_outcome=(response.get("outcome") if isinstance(response, dict) else None),
+                       cancel_deadline_epoch=(response.get("deadline_epoch") if isinstance(response, dict) else None),
+                       cancel_started_epoch=(response.get("cancel_started_epoch") if isinstance(response, dict) else None),
+                       cancel_completed_epoch=(response.get("cancel_completed_epoch") if isinstance(response, dict) else None),
+                       cancel_worker_elapsed_ms=(response.get("elapsed_ms") if isinstance(response, dict) else None),
+                       cancel_worker_attempt=(response.get("attempt") if isinstance(response, dict) else None),
+                       cancel_worker_retry_delay_seconds=(response.get("retry_delay_seconds") if isinstance(response, dict) else None),
+                       cancel_worker_next_retry_epoch=(response.get("next_retry_epoch") if isinstance(response, dict) else None),
+                       cancel_worker_last_outcome=(response.get("last_response_outcome") if isinstance(response, dict) else None))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

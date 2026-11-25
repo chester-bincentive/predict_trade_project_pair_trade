@@ -229,6 +229,32 @@ async def _run_live_order_reconciliation_watchdog(
         await asyncio.sleep(min(0.25, max(0.05, settings.live_retry_interval_seconds / 4.0)))
 
 
+async def _run_event_loop_lag_monitor(store: Store, run_id: str) -> None:
+    """Persist long event-loop stalls that can delay live reconciliation work."""
+    loop = asyncio.get_running_loop()
+    interval = 0.25
+    threshold = 0.5
+    expected = loop.time() + interval
+    while True:
+        await asyncio.sleep(max(0.0, expected - loop.time()))
+        observed = loop.time()
+        lag_ms = max(0.0, observed - expected) * 1000.0
+        if lag_ms >= threshold * 1000.0:
+            details = {"lag_ms": round(lag_ms, 3),
+                       "monitor_interval_ms": int(interval * 1000),
+                       "threshold_ms": int(threshold * 1000),
+                       "observed_epoch": time.time()}
+            print(f"EVENT LOOP LAG DETECTED lag_ms={lag_ms:.1f}", flush=True)
+            try:
+                store.record_runtime_event(
+                    run_id=run_id, event_type="event_loop_lag_detected",
+                    venue="polymarket", details=details,
+                )
+            except Exception as exc:
+                print(f"EVENT LOOP LAG RECORD ERROR ({type(exc).__name__})", flush=True)
+        expected = observed + interval
+
+
 async def _live(settings: Settings, duration: float, execution_mode: str = "paper") -> None:
     if execution_mode not in {"paper", "live"}:
         raise ValueError("execution mode must be paper or live")
@@ -346,6 +372,7 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
     notifier_task: asyncio.Task[None] | None = None
     exit_watchdog_task: asyncio.Task[None] | None = None
     order_watchdog_task: asyncio.Task[None] | None = None
+    event_loop_monitor_task: asyncio.Task[None] | None = None
     status_logger = _LiveStatusLogger()
     feed_error_logger = _FeedErrorLogger()
     if execution_mode == "live":
@@ -420,6 +447,10 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
             order_watchdog_task = asyncio.create_task(
                 _run_live_order_reconciliation_watchdog(engine, settings),
                 name="live-order-reconciliation-watchdog",
+            )
+            event_loop_monitor_task = asyncio.create_task(
+                _run_event_loop_lag_monitor(store, run_id),
+                name="live-event-loop-lag-monitor",
             )
         if settings.discord_webhook_url:
             notifier = DiscordPnLNotifier(
@@ -509,6 +540,9 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                 await asyncio.sleep(settings.poll_seconds)
     finally:
         try:
+            if event_loop_monitor_task is not None:
+                event_loop_monitor_task.cancel()
+                await asyncio.gather(event_loop_monitor_task, return_exceptions=True)
             if order_watchdog_task is not None:
                 order_watchdog_task.cancel()
                 await asyncio.gather(order_watchdog_task, return_exceptions=True)

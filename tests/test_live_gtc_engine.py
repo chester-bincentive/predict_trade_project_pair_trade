@@ -23,6 +23,24 @@ class MovingBookExecutor:
         self.requested_qty = 0.0
         self.order_count = 0
         self.wait_seconds: float | None = None
+        self.cancel_deadlines: list[tuple[str, float]] = []
+
+    def register_user_order_intent(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def forget_user_order_intent(self, intent_key: str) -> None:
+        pass
+
+    def schedule_gtc_cancel_deadline(self, order_id: str, deadline_epoch: float) -> None:
+        self.cancel_deadlines.append((order_id, deadline_epoch))
+
+    def has_gtc_cancel(self, order_id: str) -> bool:
+        return any(existing_id == order_id for existing_id, _ in self.cancel_deadlines)
+
+    async def forget_gtc_cancel(self, order_id: str) -> None:
+        self.cancel_deadlines = [
+            item for item in self.cancel_deadlines if item[0] != order_id
+        ]
 
     async def verify_market(self, market: Market) -> Decimal:
         return Decimal("0.01")
@@ -169,7 +187,8 @@ class LiveGtcBookRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(intent_details["limit_price"], "0.15")
         self.assertEqual(intent_details["limit_price_offset_ticks"], 3)
 
-        worker = self.engine._live_entry_task
+        trade_id = int(self.engine.active["trade_id"])
+        worker = self.engine._live_entry_tasks[trade_id]
         self.assertIsNotNone(worker)
         await worker
         self.assertEqual(self.executor.wait_seconds, 2.0)

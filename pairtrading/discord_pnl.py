@@ -97,6 +97,7 @@ class DiscordPnLNotifier:
 
     async def _send_summary(self) -> None:
         stats = self._stats()
+        ledger_read_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         session_count = max(0, stats["completed"] - self.baseline["completed"])
         session_wins = max(0, stats["wins"] - self.baseline["wins"])
         session_pnl = stats["pnl"] - self.baseline["pnl"]
@@ -108,23 +109,27 @@ class DiscordPnLNotifier:
         lines = [
             f"**BTC 5 分鐘 Polymarket 單腿 {self.trading_mode.title()} 損益**",
             f"更新時間（UTC）：{datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+            f"帳本統計截至（UTC）：{ledger_read_at}",
             f"本次啟動後：已實現 ${session_pnl:+.4f}｜完成 {session_count} 筆｜"
             f"勝率 {self._win_rate(session_wins, session_count)}",
             f"資料庫累計：已實現 ${stats['pnl']:+.4f}｜完成 {stats['completed']} 筆｜"
             f"勝率 {self._win_rate(stats['wins'], stats['completed'])}",
-            f"目前交易：未平倉 {stats['open']}｜未解決 {stats['unresolved']}｜未建立持倉 {stats['no_position']}",
+            f"目前交易：未平倉 {stats['open']}｜未解決 {stats['unresolved']}｜"
+            f"結算待確認 {stats['settlement_pending']}｜未建立持倉 {stats['no_position']}",
         ]
         if self.trading_mode == "live":
             try:
                 if self.collateral_balance_provider is None:
                     raise RuntimeError("live collateral balance provider is unavailable")
                 balance = await self.collateral_balance_provider()
-                lines.append(f"Collateral balance (pUSD)：${balance:,.6f}")
+                balance_read_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                lines.append(f"Collateral balance (pUSD)：${balance:,.6f}｜讀取時間（UTC）：{balance_read_at}")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 lines.append("Collateral balance (pUSD)：暫時讀取失敗")
                 print(f"DISCORD BALANCE READ ERROR ({type(exc).__name__}); will retry", flush=True)
+        lines[1] = f"更新時間（UTC）：{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
         lines.append(mode_line)
         message = "\n".join(lines)
         response = await self.client.post(self.webhook_url, json={"content": message})
@@ -145,6 +150,7 @@ class DiscordPnLNotifier:
             "wins": sum(pnl > 0 for pnl in pnls),
             "open": sum(row["status"] == "OPEN" for row in rows),
             "unresolved": sum(str(row["status"]).startswith("UNRESOLVED") for row in rows),
+            "settlement_pending": sum(row["status"] == "SETTLEMENT_PENDING" for row in rows),
             "no_position": sum(row["status"] in {"NO_PAIR", "NO_POSITION"} for row in rows),
         }
 

@@ -4,9 +4,10 @@ import asyncio
 import json
 import random
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_UP
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 from .config import Settings
 from .live_execution import (
@@ -285,8 +286,49 @@ class ShadowEngine:
             raise RuntimeError("use await process_async() when live execution is enabled")
         return asyncio.run(self.process_async(snapshot, evaluate_signals=evaluate_signals))
 
+    @asynccontextmanager
+    async def _timed_process_lock(
+        self, operation: str, *, market_key: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> AsyncIterator[None]:
+        queued_at = time.monotonic()
+        await self._process_lock.acquire()
+        acquired_at = time.monotonic()
+        outcome = "completed"
+        error_type = None
+        try:
+            yield
+        except BaseException as exc:
+            outcome = "raised"
+            error_type = type(exc).__name__
+            raise
+        finally:
+            released_at = time.monotonic()
+            wait_ms = (acquired_at - queued_at) * 1000.0
+            hold_ms = (released_at - acquired_at) * 1000.0
+            self._process_lock.release()
+            if wait_ms >= 100.0 or hold_ms >= 250.0:
+                try:
+                    self.store.record_runtime_event(
+                        run_id=self.run_id or "process-lock-monitor",
+                        event_type="process_lock_delay",
+                        market_key=market_key,
+                        venue="polymarket",
+                        details={"operation": operation,
+                                 "wait_ms": round(wait_ms, 3),
+                                 "hold_ms": round(hold_ms, 3),
+                                 "outcome": outcome,
+                                 "error_type": error_type,
+                                 **(details or {})},
+                    )
+                except Exception as exc:
+                    print(f"PROCESS LOCK TIMING RECORD ERROR ({type(exc).__name__})", flush=True)
+
     async def process_async(self, snapshot: PairSnapshot, *, evaluate_signals: bool = True) -> str:
-        async with self._process_lock:
+        async with self._timed_process_lock(
+            "process_async", market_key=snapshot.market_key,
+            details={"evaluate_signals": evaluate_signals},
+        ):
             return await self._process_async_unlocked(
                 snapshot, evaluate_signals=evaluate_signals,
             )
@@ -1241,7 +1283,7 @@ class ShadowEngine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            async with self._process_lock:
+            async with self._timed_process_lock("live_sell_presign_failed", market_key=str(state.get("market_key"))):
                 self._event(
                     state, "SELL_PRESIGN", leg, side="SELL",
                     status="LIVE_SELL_PRESIGN_FAILED", requested=shares,
@@ -1251,7 +1293,7 @@ class ShadowEngine:
                 self._persist()
             return
         if result.get("status") == "ready":
-            async with self._process_lock:
+            async with self._timed_process_lock("live_sell_presign_ready", market_key=str(state.get("market_key"))):
                 self._event(
                     state, "SELL_PRESIGN", leg, side="SELL",
                     status="LIVE_SELL_PRESIGNED", requested=shares,
@@ -1313,16 +1355,33 @@ class ShadowEngine:
         order["live_gtc_trade_id"] = trade_id
         order["live_gtc_wait_seconds"] = self.settings.live_buy_unfilled_ttl_seconds
         order["live_gtc_initial_wait_completed"] = False
-        order["live_gtc_accepted_epoch"] = time.time()
+        accepted_epoch = time.time()
+        deadline_epoch = accepted_epoch + self.settings.live_buy_unfilled_ttl_seconds
+        order["live_gtc_accepted_epoch"] = accepted_epoch
+        order["live_gtc_deadline_epoch"] = deadline_epoch
+        order["live_gtc_cancel_worker_scheduled"] = False
         order["live_gtc_worker_started_epoch"] = None
         order["live_gtc_last_progress_epoch"] = None
         order["live_gtc_accepted_details"] = dict(accepted_details)
         order["live_gtc_attempt_details"] = dict(attempt_details)
         order["live_gtc_timing_context"] = dict(timing_context)
         order["live_gtc_next_poll_epoch"] = (
-            time.time() + self.settings.live_buy_unfilled_ttl_seconds + 0.1
+            deadline_epoch + 0.1
         )
         self._persist_state(state)
+        try:
+            self.live_executor.schedule_gtc_cancel_deadline(order_id, deadline_epoch)
+            order["live_gtc_cancel_worker_scheduled"] = True
+            self._persist_state(state)
+        except Exception as exc:
+            self.store.record_runtime_event(
+                run_id=self.run_id or "live-entry-worker",
+                event_type="live_gtc_cancel_worker_schedule_failed",
+                market_key=str(state.get("market_key")), venue="polymarket",
+                details={"trade_id": trade_id, "order_id": order_id,
+                         "deadline_epoch": deadline_epoch,
+                         "error_type": type(exc).__name__},
+            )
         self._start_live_entry_finalization(
             state, leg, order, market, book, snapshot_id,
             attempt_details, timing_context, accepted_details,
@@ -1384,6 +1443,9 @@ class ShadowEngine:
                 "order_id": order_id,
                 "leg": str(leg["name"]),
                 "wait_seconds": wait_seconds,
+                "accepted_epoch": order.get("live_gtc_accepted_epoch"),
+                "cancel_deadline_epoch": order.get("live_gtc_deadline_epoch"),
+                "cancel_worker_scheduled": order.get("live_gtc_cancel_worker_scheduled"),
                 "resumed": resumed,
             },
         )
@@ -1451,8 +1513,9 @@ class ShadowEngine:
                 post_order_status=str(accepted_details.get("order_status") or ""),
                 progress_callback=record_progress,
             )
+            await self.live_executor.forget_gtc_cancel(order_id)
         except asyncio.CancelledError:
-            async with self._process_lock:
+            async with self._timed_process_lock("live_gtc_finalizer_cancelled", market_key=str(state.get("market_key"))):
                 if order.get("live_gtc_pending"):
                     self._record_live_entry_reconciliation_retry(
                         state, leg, order,
@@ -1462,7 +1525,7 @@ class ShadowEngine:
                     )
             raise
         except Exception as exc:
-            async with self._process_lock:
+            async with self._timed_process_lock("live_gtc_finalizer_failed", market_key=str(state.get("market_key"))):
                 if not order.get("live_gtc_pending"):
                     return
                 self._record_live_entry_reconciliation_retry(
@@ -1473,13 +1536,14 @@ class ShadowEngine:
                 )
             return
 
-        async with self._process_lock:
+        async with self._timed_process_lock("live_gtc_finalizer_completed", market_key=str(state.get("market_key"))):
             if not order.get("live_gtc_pending"):
                 return
             filled = 0.0 if fill is None else float(fill.filled_qty)
             notional = 0.0 if fill is None else float(fill.notional)
             fee = 0.0 if fill is None else float(fill.fee)
             order["live_gtc_pending"] = False
+            order["live_gtc_cancel_worker_scheduled"] = False
             order["live_gtc_worker_started_epoch"] = None
             order["live_gtc_last_progress_epoch"] = time.time()
             order["live_gtc_stale_cancel_requested_epoch"] = None
@@ -1707,7 +1771,7 @@ class ShadowEngine:
         outcome = "not_claimed"
         started = time.monotonic()
         try:
-            async with self._process_lock:
+            async with self._timed_process_lock("live_exit_worker_claim", market_key=str(state.get("market_key"))):
                 if (
                     state.get("live_order_unknown")
                     or state.get("status") == "SETTLEMENT_PENDING"
@@ -1757,7 +1821,7 @@ class ShadowEngine:
                         float(result.get("fee", 0.0)),
                     )
                 else:
-                    async with self._process_lock:
+                    async with self._timed_process_lock("live_exit_worker_error", market_key=str(state.get("market_key"))):
                         if self._live_exit_inflight(trade_id):
                             if expected_order.get("live_api_started"):
                                 state["live_order_unknown"] = True
@@ -1813,7 +1877,7 @@ class ShadowEngine:
                     outcome = "error_unknown" if state.get("live_order_unknown") else "pre_submit_retry"
                     return
 
-            async with self._process_lock:
+            async with self._timed_process_lock("live_exit_worker_result", market_key=str(state.get("market_key"))):
                 if (not self._live_exit_inflight(trade_id)
                         or leg.get("exit_order") is not expected_order):
                     outcome = "state_changed"
@@ -1870,7 +1934,7 @@ class ShadowEngine:
                 self._persist_state(state)
 
             if float(leg["exit_remaining"]) > 1e-9:
-                async with self._process_lock:
+                async with self._timed_process_lock("live_exit_retry", market_key=str(state.get("market_key"))):
                     if (not self._live_exit_inflight(trade_id)
                             or leg.get("exit_order") is not expected_order):
                         outcome = "state_changed_before_retry_schedule"
@@ -1897,7 +1961,7 @@ class ShadowEngine:
                     outcome = "retry_scheduled"
         finally:
             if claimed:
-                async with self._process_lock:
+                async with self._timed_process_lock("live_exit_worker_cleanup", market_key=str(state.get("market_key"))):
                     self._live_exit_inflight_trade_ids.discard(trade_id)
                     self.store.record_runtime_event(
                         run_id=self.run_id or "live-exit-worker",
@@ -2309,7 +2373,7 @@ class ShadowEngine:
 
     async def resolve_market_async(self, market: Market, winning_asset_id: str,
                                    resolved_at: datetime) -> bool:
-        async with self._process_lock:
+        async with self._timed_process_lock("market_resolution", market_key=market.key):
             return self.resolve_market(market, winning_asset_id, resolved_at)
 
     def resolve_market(self, market: Market, winning_asset_id: str,
@@ -2497,7 +2561,7 @@ class ShadowEngine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            async with self._process_lock:
+            async with self._timed_process_lock("live_gtc_discovery_retry", market_key=str(state.get("market_key"))):
                 if not order.get("live_gtc_discovery_pending"):
                     return
                 attempts = int(order.get("live_gtc_discovery_attempts", 0)) + 1
@@ -2519,7 +2583,7 @@ class ShadowEngine:
                 )
             return
 
-        async with self._process_lock:
+        async with self._timed_process_lock("live_gtc_discovery_completed", market_key=str(state.get("market_key"))):
             if not order.get("live_gtc_discovery_pending"):
                 return
             order["live_gtc_order_id"] = str(order_id)
@@ -2532,9 +2596,10 @@ class ShadowEngine:
                 order.get("live_gtc_wait_seconds")
                 or self.settings.live_buy_unfilled_ttl_seconds
             )
-            order["live_gtc_next_poll_epoch"] = (
-                intent_epoch + float(order["live_gtc_wait_seconds"])
-            )
+            deadline_epoch = intent_epoch + float(order["live_gtc_wait_seconds"])
+            order["live_gtc_deadline_epoch"] = deadline_epoch
+            order["live_gtc_cancel_worker_scheduled"] = False
+            order["live_gtc_next_poll_epoch"] = deadline_epoch
             accepted = {
                 "order_id": str(order_id), "order_status": "unknown",
                 "order_id_recovered_from_intent": True, **lookup,
@@ -2550,6 +2615,21 @@ class ShadowEngine:
                 details={"trade_id": trade_id, "order_id": str(order_id),
                          "intent_key": intent_key, **lookup},
             )
+            try:
+                self.live_executor.schedule_gtc_cancel_deadline(
+                    str(order_id), deadline_epoch,
+                )
+                order["live_gtc_cancel_worker_scheduled"] = True
+                self._persist_state(state)
+            except Exception as exc:
+                self.store.record_runtime_event(
+                    run_id=self.run_id or "live-order-reconciler",
+                    event_type="live_gtc_cancel_worker_schedule_failed",
+                    market_key=str(state.get("market_key")), venue="polymarket",
+                    details={"trade_id": trade_id, "order_id": str(order_id),
+                             "deadline_epoch": deadline_epoch,
+                             "error_type": type(exc).__name__},
+                )
             wait_seconds = max(
                 0.0, intent_epoch + float(order["live_gtc_wait_seconds"]) - time.time(),
             )
@@ -2646,7 +2726,7 @@ class ShadowEngine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            async with self._process_lock:
+            async with self._timed_process_lock("live_fak_reconciliation_retry", market_key=str(state.get("market_key"))):
                 if not order.get("live_fak_reconcile_pending"):
                     return
                 attempts = int(order.get("live_fak_reconcile_attempts", 0)) + 1
@@ -2682,7 +2762,7 @@ class ShadowEngine:
                 )
             return
 
-        async with self._process_lock:
+        async with self._timed_process_lock("live_fak_reconciliation_completed", market_key=str(state.get("market_key"))):
             if not order.get("live_fak_reconcile_pending"):
                 return
             now = time.time()
@@ -2816,7 +2896,7 @@ class ShadowEngine:
             return 0
         now = time.time()
         queued = 0
-        async with self._process_lock:
+        async with self._timed_process_lock("live_entry_reconciliation"):
             active = self.active
             if (
                 active is not None
@@ -2885,6 +2965,30 @@ class ShadowEngine:
                                 queued += 1
                     if not order.get("live_gtc_pending") or not order_id:
                         continue
+                    configured_wait = float(order.get("live_gtc_wait_seconds")
+                                            or self.settings.live_buy_unfilled_ttl_seconds)
+                    accepted_epoch = float(order.get("live_gtc_accepted_epoch") or 0.0)
+                    deadline_epoch = float(
+                        order.get("live_gtc_deadline_epoch")
+                        or (accepted_epoch + configured_wait if accepted_epoch else now)
+                    )
+                    if not self.live_executor.has_gtc_cancel(order_id):
+                        try:
+                            self.live_executor.schedule_gtc_cancel_deadline(
+                                order_id, deadline_epoch,
+                            )
+                            order["live_gtc_deadline_epoch"] = deadline_epoch
+                            order["live_gtc_cancel_worker_scheduled"] = True
+                            self._persist_state(state)
+                        except Exception as exc:
+                            self.store.record_runtime_event(
+                                run_id=self.run_id or "live-entry-watchdog",
+                                event_type="live_gtc_cancel_worker_schedule_failed",
+                                market_key=str(state.get("market_key")), venue="polymarket",
+                                details={"trade_id": trade_id, "order_id": order_id,
+                                         "deadline_epoch": deadline_epoch,
+                                         "error_type": type(exc).__name__},
+                            )
                     due = float(order.get("live_gtc_next_poll_epoch") or 0.0)
                     if due > now:
                         continue
@@ -2904,9 +3008,6 @@ class ShadowEngine:
                     accepted.setdefault("order_id", order_id)
                     attempt_details = dict(order.get("live_gtc_attempt_details") or {})
                     timing_context = dict(order.get("live_gtc_timing_context") or {})
-                    accepted_epoch = float(order.get("live_gtc_accepted_epoch") or 0.0)
-                    configured_wait = float(order.get("live_gtc_wait_seconds")
-                                            or self.settings.live_buy_unfilled_ttl_seconds)
                     wait_seconds = max(0.0, accepted_epoch + configured_wait - now) if accepted_epoch else (
                         0.0 if order.get("live_gtc_initial_wait_completed") else configured_wait
                     )
@@ -2980,7 +3081,7 @@ class ShadowEngine:
         """Advance max-hold and live exit retries from the Polymarket book alone."""
         if self.live_executor is None:
             return None
-        async with self._process_lock:
+        async with self._timed_process_lock("live_exit_due", market_key=str(self.active.get("market_key")) if self.active else None):
             state = self.active
             if (
                 state is None or state.get("live_order_unknown")

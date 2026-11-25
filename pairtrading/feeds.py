@@ -300,23 +300,48 @@ class BinancePredictFeed:
         values["signature"] = signature
         return values
 
+    def _safe_api_error_message(self, value: Any) -> str:
+        message = " ".join(str(value or "").split())
+        for secret in (self.api_key, self.api_secret):
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+        message = re.sub(
+            r"(?i)(signature|api[_ -]?key|secret)(\s*[:=]\s*)[^,\s&]+",
+            r"\1\2[REDACTED]", message,
+        )
+        return message[:240]
+
     async def _get(self, path: str, params: Mapping[str, Any], *, signed: bool = True) -> Mapping[str, Any]:
         headers = {"X-MBX-APIKEY": self.api_key} if self.api_key else {}
         request_params = self._signed_params(params) if signed else params
         response = await self.client.get(
             f"{BINANCE_URL}{path}", params=request_params, headers=headers,
         )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        safe_path = str(path).split("?", 1)[0]
+        if response.is_error:
+            if isinstance(payload, Mapping):
+                code = payload.get("code", "unknown")
+                message = self._safe_api_error_message(payload.get("msg", ""))
+            else:
+                code, message = "unknown", "non-JSON error response"
+            raise FeedError(
+                f"Binance Predict HTTP {response.status_code} {safe_path} "
+                f"code={code}: {message}"
+            )
         if not isinstance(payload, Mapping):
-            raise FeedError(f"Binance Predict returned a non-object for {path}")
+            raise FeedError(f"Binance Predict returned a non-object for {safe_path}")
         if "code" in payload:
             try:
                 code = int(payload["code"])
             except (ValueError, TypeError):
                 code = payload["code"]
             if code != 0:
-                raise FeedError(f"Binance Predict API error {code}: {payload.get('msg', '')}")
+                message = self._safe_api_error_message(payload.get("msg", ""))
+                raise FeedError(f"Binance Predict API error {code} {safe_path}: {message}")
         return payload
 
     async def sync_clock(self) -> None:

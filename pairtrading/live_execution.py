@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -277,8 +278,15 @@ class PolymarketLiveExecutor:
                 previous = Decimal(str(state.get("size_matched", "-1")))
                 if qty.is_finite() and qty >= 0:
                     state["size_matched"] = format(max(qty, previous), "f")
+                    if source == "USER_WS":
+                        previous_ws = Decimal(str(state.get("user_ws_size_matched", "-1")))
+                        state["user_ws_size_matched"] = format(max(qty, previous_ws), "f")
             except (InvalidOperation, TypeError, ValueError):
                 pass
+        if source == "USER_WS" and status:
+            old_ws_status = str(state.get("user_ws_status", "")).lower()
+            if not (old_ws_status in terminal and status not in terminal):
+                state["user_ws_status"] = status
         state["source"] = source
         self._user_order_states[order_id] = state
         self._user_order_states.move_to_end(order_id)
@@ -435,12 +443,20 @@ class PolymarketLiveExecutor:
         while True:
             self._user_state_changed.clear()
             state = self._user_order_states.get(order_id, {})
-            status = str(state.get("status", "")).lower()
+            status = str(state.get("user_ws_status", "")).lower()
             try:
-                matched = Decimal(str(state.get("size_matched")))
+                matched = Decimal(str(state.get("user_ws_size_matched", "-1")))
             except (InvalidOperation, TypeError, ValueError):
-                matched = Decimal("0")
-            if status in {"matched", "filled"} or matched >= Decimal(str(requested_qty)) - Decimal("0.0001"):
+                matched = Decimal("-1")
+            ws_trade_qty = sum((
+                item["size"]
+                for item in self._user_trade_rows.get(order_id, {}).values()
+                if item.get("source") == "USER_WS"
+                and str(item.get("status", "")).upper() != "FAILED"
+            ), Decimal("0"))
+            if (status in {"matched", "filled"}
+                    or matched >= Decimal(str(requested_qty)) - Decimal("0.0001")
+                    or ws_trade_qty > 0):
                 return
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -1380,10 +1396,6 @@ class PolymarketLiveExecutor:
                 "requested_qty": Decimal(size_text),
             }
             self._tracked_gtc_orders.move_to_end(oid)
-            self._remember_user_order(oid, {
-                "status": status,
-                "size_matched": _field(response, "size_matched", "sizeMatched"),
-            }, "POST_RESPONSE")
         _ACTIVE_ORDER_TRACE.reset(token)
         if not accepted:
             return False, None, details
@@ -1398,6 +1410,7 @@ class PolymarketLiveExecutor:
     async def cancel_and_reconcile_gtc_buy(
         self, *, order_id: str, asset_id: str, condition_id: str,
         requested_qty: float, wait_seconds: float,
+        post_order_status: str | None = None,
         progress_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> tuple[Fill | None, dict[str, Any]]:
         """Use User WS for timely state and REST trades to reconcile every GTC fill."""
@@ -1417,13 +1430,43 @@ class PolymarketLiveExecutor:
             report(step, "started", attempt=attempt,
                    timeout_seconds=self._GTC_REST_CALL_TIMEOUT_SECONDS)
             started = time.monotonic()
+            task: asyncio.Future[Any] | None = None
+
+            def consume_late_result(done_task: asyncio.Future[Any]) -> None:
+                if done_task.cancelled():
+                    return
+                try:
+                    done_task.exception()
+                except Exception:
+                    pass
+
             try:
-                result = await asyncio.wait_for(
-                    call(), timeout=self._GTC_REST_CALL_TIMEOUT_SECONDS,
-                )
+                operation = call()
+                if not inspect.isawaitable(operation):
+                    result = operation
+                else:
+                    task = asyncio.ensure_future(operation)
+                    done, _ = await asyncio.wait(
+                        {task}, timeout=self._GTC_REST_CALL_TIMEOUT_SECONDS,
+                    )
+                    if not done:
+                        task.cancel()
+                        task.add_done_callback(consume_late_result)
+                        raise asyncio.TimeoutError(
+                            f"{step} exceeded {self._GTC_REST_CALL_TIMEOUT_SECONDS:.1f}s"
+                        )
+                    result = task.result()
             except asyncio.CancelledError:
+                if task is not None and not task.done():
+                    task.cancel()
+                    task.add_done_callback(consume_late_result)
                 report(step, "cancelled", attempt=attempt,
                        elapsed_ms=round((time.monotonic() - started) * 1000.0, 3))
+                raise
+            except asyncio.TimeoutError as exc:
+                report(step, "timeout", attempt=attempt,
+                       elapsed_ms=round((time.monotonic() - started) * 1000.0, 3),
+                       error=_safe_diagnostic_text(exc))
                 raise
             except Exception as exc:
                 report(step, "error", attempt=attempt,
@@ -1438,23 +1481,47 @@ class PolymarketLiveExecutor:
         context = self._tracked_gtc_orders.setdefault(order_id, {})
         context.update({"asset_id": asset_id, "condition_id": condition_id,
                         "requested_qty": Decimal(str(requested_qty))})
+        post_status = str(
+            post_order_status or context.get("post_order_status", "") or ""
+        ).lower()
+        context["post_order_status"] = post_status
+        # The POST acknowledgement's matched state is retained as a hint only.
+        # Do not turn it into a User WebSocket event or use it as fill evidence.
         report("user_ws_wait", "started", wait_seconds=wait_seconds)
         await self._wait_gtc_fill_or_timeout(order_id, requested_qty, wait_seconds)
         ws = dict(self._user_order_states.get(order_id, {}))
-        ws_status = str(ws.get("status", "") or "").lower()
-        report("user_ws_wait", "completed", order_status=ws_status or None,
-               size_matched=ws.get("size_matched"))
+        ws_status = str(ws.get("user_ws_status", "") or "").lower()
         try:
-            ws_qty = Decimal(str(ws.get("size_matched")))
+            ws_qty = Decimal(str(ws.get("user_ws_size_matched")))
             if not ws_qty.is_finite() or ws_qty < 0:
                 ws_qty = Decimal("-1")
         except (InvalidOperation, TypeError, ValueError):
             ws_qty = Decimal("-1")
-        full_seen = ws_status in {"matched", "filled"} or ws_qty >= Decimal(str(requested_qty)) - Decimal("0.0001")
+        ws_trade_qty = sum((
+            item["size"]
+            for item in self._user_trade_rows.get(order_id, {}).values()
+            if item.get("source") == "USER_WS"
+            and str(item.get("status", "")).upper() != "FAILED"
+        ), Decimal("0"))
+        ws_trade_count = sum(
+            1 for item in self._user_trade_rows.get(order_id, {}).values()
+            if item.get("source") == "USER_WS"
+        )
+        report("user_ws_wait", "completed", order_status=ws_status or None,
+               size_matched=ws.get("user_ws_size_matched"),
+               ws_source="USER_WS" if ws_status or ws.get("user_ws_size_matched") is not None or ws_trade_count else None,
+               ws_trade_count=ws_trade_count,
+               ws_trade_matched_qty=format(ws_trade_qty, "f"),
+               post_order_status=post_status or None)
+        full_seen = (
+            ws_status in {"matched", "filled"}
+            or ws_qty >= Decimal(str(requested_qty)) - Decimal("0.0001")
+        )
+        matched_hint = full_seen or post_status in {"matched", "filled"}
         cancellation_confirmed = False
         cancel_error = None
         not_canceled: Any = {}
-        if not full_seen:
+        if not matched_hint:
             try:
                 response = await timed_call(
                     "cancel_order", 1,
@@ -1475,7 +1542,7 @@ class PolymarketLiveExecutor:
         order_state = None
         order_error = None
         terminal = {"canceled", "cancelled", "matched", "filled", "expired"}
-        for attempt in range(1, 4):
+        for attempt in (range(1, 4) if not matched_hint else ()):
             try:
                 order_state = await timed_call(
                     "get_order", attempt,
@@ -1554,7 +1621,7 @@ class PolymarketLiveExecutor:
             )
             current_ws = dict(self._user_order_states.get(order_id, {}))
             try:
-                current_ws_qty = Decimal(str(current_ws.get("size_matched")))
+                current_ws_qty = Decimal(str(current_ws.get("user_ws_size_matched")))
                 if not current_ws_qty.is_finite() or current_ws_qty < 0:
                     current_ws_qty = Decimal("-1")
             except (InvalidOperation, TypeError, ValueError):
@@ -1578,8 +1645,13 @@ class PolymarketLiveExecutor:
 
         total = sum((row[1] for row in rows.values()), Decimal("0"))
         latest_ws = dict(self._user_order_states.get(order_id, {}))
-        latest_ws_status = str(latest_ws.get("status", "") or "").lower()
-        status = rest_status if rest_status in terminal else latest_ws_status if latest_ws_status in terminal else ""
+        latest_ws_status = str(latest_ws.get("user_ws_status", "") or "").lower()
+        status = (
+            rest_status if rest_status in terminal
+            else latest_ws_status if latest_ws_status in terminal
+            else post_status if post_status in terminal
+            else ""
+        )
         confirmed_trade_qty = sum(
             (row[1] for row in rows.values() if row[3] in {"MINED", "CONFIRMED"}),
             Decimal("0"),
@@ -1602,7 +1674,8 @@ class PolymarketLiveExecutor:
                     "order_id": order_id, "rest_order_status": rest_status or None,
                     "user_ws_order_status": latest_ws_status or None,
                     "rest_size_matched": raw_rest_qty,
-                    "user_ws_size_matched": latest_ws.get("size_matched"),
+                    "user_ws_size_matched": latest_ws.get("user_ws_size_matched"),
+                    "post_order_status": post_status or None,
                     "cancel_error": cancel_error, "order_query_error": order_error,
                     "trade_query_error": trade_error, "trade_size_matched": format(total, "f"),
                     "cancellation_confirmed": cancellation_confirmed, "not_canceled": not_canceled,
@@ -1628,7 +1701,10 @@ class PolymarketLiveExecutor:
                           "cancel_error": cancel_error, "order_query_error": order_error,
                           "trade_query_error": trade_error,
                           "cancellation_confirmed": cancellation_confirmed,
-                          "user_ws_used": bool(latest_ws), "trade_ids_empty": True}
+                          "user_ws_used": bool(latest_ws_status or latest_ws.get("user_ws_size_matched") is not None
+                                               or any(item.get("source") == "USER_WS"
+                                                      for item in self._user_trade_rows.get(order_id, {}).values())),
+                          "trade_ids_empty": True}
         if abs(total - matched) > Decimal("0.0001"):
             raise LiveOrderUnknown(
                 f"BUY GTC fills did not reconcile to order size_matched order_id={order_id}",
@@ -1657,7 +1733,9 @@ class PolymarketLiveExecutor:
                       "cancel_error": cancel_error, "order_query_error": order_error,
                       "trade_query_error": trade_error,
                       "cancellation_confirmed": cancellation_confirmed,
-                      "user_ws_used": bool(latest_ws),
+                      "user_ws_used": bool(latest_ws_status or latest_ws.get("user_ws_size_matched") is not None
+                                           or any(item.get("source") == "USER_WS"
+                                                  for item in self._user_trade_rows.get(order_id, {}).values())),
                       "order_status_inferred_from_confirmed_trades": inferred_terminal_from_trades,
                       "fill_source": "REST_ACCOUNT_TRADES" if rest_rows_found else "USER_WS_CONFIRMED_TRADE"}
 

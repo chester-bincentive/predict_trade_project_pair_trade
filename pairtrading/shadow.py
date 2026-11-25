@@ -1334,6 +1334,7 @@ class ShadowEngine:
                 condition_id=str(market.condition_id),
                 requested_qty=float(order["requested"]),
                 wait_seconds=wait_seconds,
+                post_order_status=str(accepted_details.get("order_status") or ""),
                 progress_callback=record_progress,
             )
         except asyncio.CancelledError:

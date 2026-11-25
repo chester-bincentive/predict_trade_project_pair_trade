@@ -940,7 +940,8 @@ class ShadowEngine:
                     if phase == "ENTRY":
                         assert limit_price is not None and tick_size is not None
                         accepted, order_id, response_details = await self.live_executor.buy_gtc_limit(
-                            asset_id=leg["token_id"], requested_qty=remaining,
+                            asset_id=leg["token_id"], condition_id=market.condition_id,
+                            requested_qty=remaining,
                             limit_price=limit_price, tick_size=tick_size,
                             on_order_signed=record_signed_order,
                             timing_context=timing_context,

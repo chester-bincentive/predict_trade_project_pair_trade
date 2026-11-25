@@ -301,7 +301,9 @@ class Store:
     def open_shadow_trades(self) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT payload_json FROM shadow_trades "
-            "WHERE status IN ('OPEN','UNRESOLVED_LIVE_ORDER','UNRESOLVED_LIVE_POSITION') ORDER BY id"
+            "WHERE status IN ('OPEN','UNRESOLVED_LIVE_ORDER','UNRESOLVED_LIVE_POSITION') "
+            "OR (status='UNRESOLVED_AT_END' AND payload_json LIKE '%\"live_gtc_pending\":true%') "
+            "ORDER BY id"
         ).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
 

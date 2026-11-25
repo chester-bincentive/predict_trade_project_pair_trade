@@ -152,7 +152,7 @@ class ShadowEngine:
             if not state.get("live_order_quarantined")
             and state.get("status") != "SETTLEMENT_PENDING"
             and not (
-                state.get("live_order_unknown")
+                (state.get("live_order_unknown") or self._has_pending_live_entry(state))
                 and float(state.get("market_end", float("inf"))) <= now
             )
         ), None)
@@ -160,9 +160,7 @@ class ShadowEngine:
         self.current_book_provider: Callable[[str, str], Book | None] | None = None
         self._process_lock = asyncio.Lock()
         self._live_exit_task: asyncio.Task[None] | None = None
-        self._live_entry_task: asyncio.Task[None] | None = None
-        self._live_entry_order: dict[str, Any] | None = None
-        self._live_entry_trade_id: int | None = None
+        self._live_entry_tasks: dict[int, asyncio.Task[None]] = {}
         self._live_exit_inflight_trade_id: int | None = None
         self._live_presign_tasks: set[asyncio.Task[None]] = set()
         if live_executor is not None and self.active is not None:
@@ -198,6 +196,56 @@ class ShadowEngine:
         except Exception as exc:
             print(f"DISCORD RISK ALERT SCHEDULE ERROR ({type(exc).__name__})", flush=True)
 
+    def _has_pending_live_entry(self, state: dict[str, Any]) -> bool:
+        return any(
+            bool((leg.get("entry_order") or {}).get("live_gtc_pending"))
+            for leg in state.get("legs", [])
+        )
+
+    def _mark_live_gtc_pending_at_market_end(
+        self, state: dict[str, Any], now_epoch: float,
+    ) -> None:
+        """Keep an accepted GTC order unresolved until account reconciliation finishes."""
+        state["status"] = "UNRESOLVED_LIVE_ORDER"
+        state["live_order_unknown"] = True
+        state["live_order_unknown_phase"] = "ENTRY"
+        state["closed_at"] = None
+        state["live_gtc_expired_at"] = float(now_epoch)
+        for leg in state.get("legs", []):
+            order = leg.get("entry_order") or {}
+            if not order.get("live_gtc_pending"):
+                continue
+            order["live_gtc_next_poll_epoch"] = min(
+                float(order.get("live_gtc_next_poll_epoch") or now_epoch),
+                float(now_epoch),
+            )
+            if not order.get("live_gtc_expiry_recorded"):
+                self._event(
+                    state, "ENTRY", leg, side="BUY",
+                    status="LIVE_GTC_PENDING_AT_MARKET_END",
+                    requested=float(order.get("requested", state.get("requested_shares", 0.0))),
+                    order=order,
+                    details={"order_id": order.get("live_gtc_order_id"),
+                             "reason": "market ended before GTC fill/cancel reconciliation completed",
+                             "reconciliation_continues": True},
+                )
+                order["live_gtc_expiry_recorded"] = True
+        self._persist_state(state)
+        self.store.record_runtime_event(
+            run_id=self.run_id or "live-entry-watchdog",
+            event_type="live_gtc_pending_at_market_end",
+            market_key=str(state.get("market_key")), venue="polymarket",
+            details={"trade_id": int(state["trade_id"]),
+                     "order_ids": [
+                         (leg.get("entry_order") or {}).get("live_gtc_order_id")
+                         for leg in state.get("legs", [])
+                         if (leg.get("entry_order") or {}).get("live_gtc_pending")
+                     ],
+                     "market_end_epoch": state.get("market_end")},
+        )
+        if self.active is state:
+            self.active = None
+
     def process(self, snapshot: PairSnapshot, *, evaluate_signals: bool = True) -> str:
         """Synchronous compatibility path for paper callers and the demo."""
         if self.live_executor is not None:
@@ -231,17 +279,20 @@ class ShadowEngine:
         if self.active is not None and self.active.get("live_order_unknown"):
             if now.timestamp() >= float(self.active.get("market_end", float("inf"))):
                 unknown_state = self.active
-                unknown_state["live_order_quarantined"] = True
-                unknown_state["closed_at"] = now.isoformat()
-                self._event(
-                    unknown_state, "TRADE", None, side=None,
-                    status="UNRESOLVED_LIVE_ORDER_QUARANTINED",
-                    details={"new_trading_allowed": True,
-                             "market_expired": True,
-                             "account_reconciliation_still_required": True},
-                )
-                self._persist()
-                self.active = None
+                if self._has_pending_live_entry(unknown_state):
+                    self._mark_live_gtc_pending_at_market_end(unknown_state, now.timestamp())
+                else:
+                    unknown_state["live_order_quarantined"] = True
+                    unknown_state["closed_at"] = now.isoformat()
+                    self._event(
+                        unknown_state, "TRADE", None, side=None,
+                        status="UNRESOLVED_LIVE_ORDER_QUARANTINED",
+                        details={"new_trading_allowed": True,
+                                 "market_expired": True,
+                                 "account_reconciliation_still_required": True},
+                    )
+                    self._persist_state(unknown_state)
+                    self.active = None
             else:
                 return (
                     "LIVE ORDER RESULT UNKNOWN; duplicate orders paused for this market; "
@@ -254,7 +305,9 @@ class ShadowEngine:
                 if now.timestamp() < float(self.active["market_end"]):
                     prefix = "LIVE" if self.live_executor is not None else "SHADOW"
                     return f"{prefix} OPEN trade {self.active['market_key']}; waiting for its matched market books"
-                if self.live_executor is not None and float(self.active.get("paired_shares", 0.0)) > 1e-9:
+                if self.live_executor is not None and self._has_pending_live_entry(self.active):
+                    self._mark_live_gtc_pending_at_market_end(self.active, now.timestamp())
+                elif self.live_executor is not None and float(self.active.get("paired_shares", 0.0)) > 1e-9:
                     expired_state = self.active
                     expired_state["status"] = "SETTLEMENT_PENDING"
                     expired_state["live_position_unresolved"] = False
@@ -560,9 +613,9 @@ class ShadowEngine:
                 result = order["live_result"]
                 return float(result["filled"]), float(result["notional"]), float(result["fee"])
             if order.get("live_gtc_pending"):
-                if self._live_entry_worker_running(order):
-                    order["live_gtc_next_poll_epoch"] = time.time() + 0.25
-                    return None
+                # The independent entry watchdog owns retries when no worker is
+                # running. Never turn a pending GTC into a zero-fill result here.
+                return None
             if order.get("live_api_started"):
                 state["live_order_unknown"] = True
                 state["live_order_unknown_phase"] = phase
@@ -1147,11 +1200,11 @@ class ShadowEngine:
         task.add_done_callback(discard_finished)
 
     def _live_entry_worker_running(self, order: dict[str, Any]) -> bool:
-        return (
-            self._live_entry_order is order
-            and self._live_entry_task is not None
-            and not self._live_entry_task.done()
-        )
+        trade_id = order.get("live_gtc_trade_id")
+        if trade_id is None:
+            return False
+        task = self._live_entry_tasks.get(int(trade_id))
+        return task is not None and not task.done()
 
     def _queue_live_entry_finalization(
         self,
@@ -1167,21 +1220,52 @@ class ShadowEngine:
     ) -> None:
         if self.live_executor is None:
             raise RuntimeError("live entry finalization requires a connected executor")
-        if self._live_entry_task is not None and not self._live_entry_task.done():
-            raise LiveOrderUnknown(
-                "another live GTC entry finalizer is still active",
-                diagnostic_fields={"order_id": accepted_details.get("order_id")},
-            )
         trade_id = int(state["trade_id"])
         order_id = str(accepted_details["order_id"])
         order["live_gtc_pending"] = True
         order["live_gtc_order_id"] = order_id
+        order["live_gtc_trade_id"] = trade_id
         order["live_gtc_wait_seconds"] = self.settings.live_buy_unfilled_ttl_seconds
+        order["live_gtc_initial_wait_completed"] = False
+        order["live_gtc_accepted_details"] = dict(accepted_details)
+        order["live_gtc_attempt_details"] = dict(attempt_details)
+        order["live_gtc_timing_context"] = dict(timing_context)
         order["live_gtc_next_poll_epoch"] = (
             time.time() + self.settings.live_buy_unfilled_ttl_seconds + 0.1
         )
-        self._live_entry_trade_id = trade_id
-        self._live_entry_order = order
+        self._persist_state(state)
+        self._start_live_entry_finalization(
+            state, leg, order, market, book, snapshot_id,
+            attempt_details, timing_context, accepted_details,
+            wait_seconds=self.settings.live_buy_unfilled_ttl_seconds,
+            resumed=False,
+        )
+
+    def _start_live_entry_finalization(
+        self,
+        state: dict[str, Any],
+        leg: dict[str, Any],
+        order: dict[str, Any],
+        market: Market,
+        book: Book | None,
+        snapshot_id: int | None,
+        attempt_details: dict[str, Any],
+        timing_context: dict[str, Any],
+        accepted_details: dict[str, Any],
+        *,
+        wait_seconds: float,
+        resumed: bool,
+    ) -> None:
+        trade_id = int(state["trade_id"])
+        current = self._live_entry_tasks.get(trade_id)
+        if current is not None and not current.done():
+            return
+        order_id = str(accepted_details.get("order_id") or order.get("live_gtc_order_id") or "")
+        if not order_id:
+            self._record_live_entry_reconciliation_retry(
+                state, leg, order, RuntimeError("pending GTC entry is missing its order ID"),
+            )
+            return
         self.store.record_runtime_event(
             run_id=self.run_id or "live-entry-worker",
             event_type="live_entry_worker_queued",
@@ -1191,19 +1275,22 @@ class ShadowEngine:
                 "trade_id": trade_id,
                 "order_id": order_id,
                 "leg": str(leg["name"]),
-                "wait_seconds": self.settings.live_buy_unfilled_ttl_seconds,
+                "wait_seconds": wait_seconds,
+                "resumed": resumed,
             },
         )
         task = asyncio.create_task(
             self._run_live_entry_finalization(
                 state, leg, order, market, book, snapshot_id,
-                attempt_details, timing_context, accepted_details,
+                attempt_details, timing_context, accepted_details, wait_seconds,
             ),
             name=f"live-entry-order-{trade_id}",
         )
-        self._live_entry_task = task
+        self._live_entry_tasks[trade_id] = task
 
         def report_worker_error(done: asyncio.Task[None]) -> None:
+            if self._live_entry_tasks.get(trade_id) is done:
+                self._live_entry_tasks.pop(trade_id, None)
             if done.cancelled():
                 return
             error = done.exception()
@@ -1223,72 +1310,70 @@ class ShadowEngine:
         attempt_details: dict[str, Any],
         timing_context: dict[str, Any],
         accepted_details: dict[str, Any],
+        wait_seconds: float,
     ) -> None:
         assert self.live_executor is not None
         order_id = str(accepted_details["order_id"])
+        trade_id = int(state["trade_id"])
+
+        def record_progress(step: str, outcome: str, details: dict[str, Any]) -> None:
+            self.store.record_runtime_event(
+                run_id=self.run_id or "live-entry-worker",
+                event_type="live_gtc_reconcile_step",
+                market_key=str(state["market_key"]), venue="polymarket",
+                details={"trade_id": trade_id, "order_id": order_id,
+                         "step": step, "outcome": outcome, **details},
+            )
+
+        order["live_gtc_initial_wait_completed"] = True
+        self._persist_state(state)
         try:
             fill, reconciliation = await self.live_executor.cancel_and_reconcile_gtc_buy(
                 order_id=order_id,
                 asset_id=str(leg["token_id"]),
                 condition_id=str(market.condition_id),
                 requested_qty=float(order["requested"]),
-                wait_seconds=self.settings.live_buy_unfilled_ttl_seconds,
+                wait_seconds=wait_seconds,
+                progress_callback=record_progress,
             )
         except asyncio.CancelledError:
             async with self._process_lock:
-                if self.active is state:
-                    state["live_order_unknown"] = True
-                    state["live_order_unknown_phase"] = "ENTRY"
-                    state["status"] = "UNRESOLVED_LIVE_ORDER"
-                    order["live_unknown"] = True
-                    order["live_gtc_pending"] = False
-                    self._event(
-                        state, "ENTRY", leg, side="BUY", status="LIVE_ORDER_UNKNOWN",
-                        requested=float(order["requested"]), book=book,
-                        snapshot_id=snapshot_id, order=order,
-                        details={
-                            **attempt_details, **timing_context,
-                            "order_id": order_id,
-                            "reason": "entry finalizer stopped before cancel/reconciliation completed",
-                        },
-                    )
-                    self._persist()
+                self._record_live_entry_reconciliation_retry(
+                    state, leg, order,
+                    RuntimeError("entry finalizer stopped before reconciliation completed"),
+                    book=book, snapshot_id=snapshot_id,
+                    details={**attempt_details, **timing_context, "order_id": order_id},
+                )
             raise
         except Exception as exc:
             async with self._process_lock:
-                if self.active is state:
-                    state["live_order_unknown"] = True
-                    state["live_order_unknown_phase"] = "ENTRY"
-                    state["status"] = "UNRESOLVED_LIVE_ORDER"
-                    order["live_unknown"] = True
-                    order["live_gtc_pending"] = False
-                    self._event(
-                        state, "ENTRY", leg, side="BUY", status="LIVE_ORDER_UNKNOWN",
-                        requested=float(order["requested"]), book=book,
-                        snapshot_id=snapshot_id, order=order,
-                        details={
-                            **attempt_details, **timing_context,
-                            **getattr(exc, "diagnostic_fields", {}),
-                            "order_id": order_id,
-                            "error_type": type(exc).__name__,
-                            "reason": "GTC cancel or fill reconciliation did not reach a definitive result",
-                        },
-                    )
-                    self._persist()
+                self._record_live_entry_reconciliation_retry(
+                    state, leg, order, exc, book=book, snapshot_id=snapshot_id,
+                    details={**attempt_details, **timing_context,
+                             **getattr(exc, "diagnostic_fields", {}),
+                             "order_id": order_id},
+                )
             return
 
         async with self._process_lock:
-            if self.active is not state:
-                return
             filled = 0.0 if fill is None else float(fill.filled_qty)
             notional = 0.0 if fill is None else float(fill.notional)
             fee = 0.0 if fill is None else float(fill.fee)
             order["live_gtc_pending"] = False
+            order["live_gtc_next_poll_epoch"] = None
+            order["live_gtc_last_error"] = None
+            order["live_gtc_reconcile_attempts"] = 0
             order["live_result_recorded"] = True
             order["live_result"] = {"filled": filled, "notional": notional, "fee": fee}
             order["live_accepted"] = True
             order["live_fill_epoch"] = time.time() if filled > 1e-9 else None
             order["live_response_details"] = {**accepted_details, **reconciliation}
+            order["live_unknown"] = False
+            state["live_order_unknown"] = False
+            state.pop("live_order_unknown_phase", None)
+            if state.get("status") == "UNRESOLVED_LIVE_ORDER":
+                state["status"] = "OPEN"
+            state["closed_at"] = None
             status = (
                 "LIVE_GTC_NO_FILL" if filled <= 1e-9
                 else "LIVE_GTC_PARTIAL_CANCELED"
@@ -1306,6 +1391,20 @@ class ShadowEngine:
                     "live_order_timing": dict(timing_context),
                 },
             )
+            expired = time.time() >= float(state.get("market_end", float("inf")))
+            if self.active is not state or expired:
+                self._apply_detached_live_entry_result(
+                    state, leg, order, filled, notional, fee,
+                )
+                self.store.record_runtime_event(
+                    run_id=self.run_id or "live-entry-worker",
+                    event_type="live_entry_worker_finished",
+                    market_key=str(state["market_key"]), venue="polymarket",
+                    details={"trade_id": trade_id, "order_id": order_id,
+                             "filled_shares": filled, "status": status,
+                             "late_result_persisted": True},
+                )
+                return
             self.store.record_runtime_event(
                 run_id=self.run_id or "live-entry-worker",
                 event_type="live_entry_worker_finished",
@@ -1318,11 +1417,102 @@ class ShadowEngine:
                     "status": status,
                 },
             )
-            self._persist()
+            self._persist_state(state)
             await self._advance(
                 None, {}, int(state.get("bucket", 0)), None,
                 market=market, captured_at=datetime.now(timezone.utc),
             )
+
+    def _record_live_entry_reconciliation_retry(
+        self, state: dict[str, Any], leg: dict[str, Any], order: dict[str, Any],
+        exc: Exception, *, book: Book | None = None, snapshot_id: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        attempts = int(order.get("live_gtc_reconcile_attempts", 0)) + 1
+        delay = min(30.0, float(2 ** min(attempts - 1, 5)))
+        now = time.time()
+        order["live_gtc_reconcile_attempts"] = attempts
+        order["live_gtc_pending"] = True
+        order["live_gtc_initial_wait_completed"] = True
+        order["live_gtc_next_poll_epoch"] = now + delay
+        order["live_gtc_last_error"] = {
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:300],
+        }
+        order["live_unknown"] = True
+        state["status"] = "UNRESOLVED_LIVE_ORDER"
+        state["live_order_unknown"] = True
+        state["live_order_unknown_phase"] = "ENTRY"
+        # An unresolved GTC entry is not a closed trade, even if an earlier
+        # market-end path had already stamped a close time on this state.
+        state["closed_at"] = None
+        self._event(
+            state, "ENTRY", leg, side="BUY", status="LIVE_GTC_RECONCILE_RETRY",
+            requested=float(order.get("requested", state.get("requested_shares", 0.0))),
+            book=book, snapshot_id=snapshot_id, order=order,
+            details={**(details or {}), "error_type": type(exc).__name__,
+                     "error": str(exc)[:300], "retry_attempt": attempts,
+                     "retry_in_seconds": delay,
+                     "reconciliation_remains_pending": True},
+        )
+        self._persist_state(state)
+        self.store.record_runtime_event(
+            run_id=self.run_id or "live-entry-worker",
+            event_type="live_entry_worker_retry_scheduled",
+            market_key=str(state["market_key"]), venue="polymarket",
+            details={"trade_id": int(state["trade_id"]),
+                     "order_id": order.get("live_gtc_order_id"),
+                     "retry_attempt": attempts, "retry_in_seconds": delay,
+                     "error_type": type(exc).__name__},
+        )
+
+    def _apply_detached_live_entry_result(
+        self, state: dict[str, Any], leg: dict[str, Any], order: dict[str, Any],
+        filled: float, notional: float, fee: float,
+    ) -> None:
+        """Apply a late GTC result to its trade row without touching a newer active trade."""
+        fill_epoch = order.get("live_fill_epoch")
+        leg["entry_attempted"] = True
+        leg["entry_filled"] = filled
+        leg["entry_cost"] = notional
+        leg["entry_fee"] = fee
+        leg["entry_fill_epoch"] = fill_epoch if filled > 1e-9 else None
+        leg["unwind_remaining"] = 0.0
+        leg["unwind_order"] = None
+        leg["exit_remaining"] = filled
+        state["entries_resolved"] = True
+        state["paired_shares"] = filled
+        state["position_shares"] = filled
+        state["entry_cost"] = notional
+        state["entry_fee"] = fee
+        state["live_order_unknown"] = False
+        state.pop("live_order_unknown_phase", None)
+        state["live_position_unresolved"] = False
+        state.pop("live_order_quarantined", None)
+        if time.time() >= float(state.get("market_end", float("inf"))):
+            state["closed_at"] = datetime.now(timezone.utc).isoformat()
+            if filled > 1e-9:
+                state["status"] = "SETTLEMENT_PENDING"
+                self._event(
+                    state, "TRADE", None, side=None, status="SETTLEMENT_PENDING",
+                    details={"position_shares": filled,
+                             "settlement_status": "awaiting Polymarket market resolution",
+                             "reason": "late GTC fill reconciliation after market end",
+                             "entry_trade_id": state.get("trade_id")},
+                )
+            else:
+                state["status"] = "NO_POSITION"
+                state["net_pnl"] = 0.0
+                self._event(
+                    state, "TRADE", None, side=None, status="NO_POSITION",
+                    details={"position_shares": 0.0,
+                             "reason": "GTC order confirmed canceled with zero fills"},
+                )
+        else:
+            state["status"] = "OPEN" if filled > 1e-9 else "NO_POSITION"
+        self._persist_state(state)
+        if state["status"] == "SETTLEMENT_PENDING":
+            self._settle_known_resolution(state)
     def _queue_live_exit_attempt(
         self, state: dict[str, Any], leg: dict[str, Any],
         order: dict[str, Any], market: Market,
@@ -1570,16 +1760,17 @@ class ShadowEngine:
                     )
 
     async def stop_live_background_tasks(self) -> None:
-        entry_task = self._live_entry_task
-        if entry_task is not None and not entry_task.done():
+        entry_tasks = [task for task in self._live_entry_tasks.values() if not task.done()]
+        if entry_tasks:
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(entry_task),
+                    asyncio.gather(*entry_tasks),
                     timeout=max(10.0, self.settings.live_buy_unfilled_ttl_seconds + 8.0),
                 )
             except asyncio.TimeoutError:
-                entry_task.cancel()
-                await asyncio.gather(entry_task, return_exceptions=True)
+                for task in entry_tasks:
+                    task.cancel()
+                await asyncio.gather(*entry_tasks, return_exceptions=True)
         tasks: list[asyncio.Task[Any]] = []
         if self._live_exit_task is not None and not self._live_exit_task.done():
             tasks.append(self._live_exit_task)
@@ -1605,6 +1796,9 @@ class ShadowEngine:
         now = captured_at.timestamp()
         dirty = False
         if now >= float(state["market_end"]):
+            if self.live_executor is not None and self._has_pending_live_entry(state):
+                self._mark_live_gtc_pending_at_market_end(state, now)
+                return "LIVE ENTRY RECONCILIATION pending; expired GTC order remains under account reconciliation"
             if self.live_executor is not None and float(state.get("paired_shares", 0.0)) > 1e-9:
                 max_hold_due = state.get("max_hold_due_epoch")
                 if (not state.get("exit_triggered") and max_hold_due is not None
@@ -1934,9 +2128,14 @@ class ShadowEngine:
                 if state.get("execution_mode") == "polymarket_only"
                 else f"{self._status_prefix} NO PAIR; entry filled zero; recording complete")
 
+    def _persist_state(self, state: dict[str, Any]) -> None:
+        """Persist any trade by its durable trade_id, including detached trades."""
+        if state.get("trade_id") is not None:
+            self.store.update_shadow_trade(state)
+
     def _persist(self) -> None:
         if self.active is not None:
-            self.store.update_shadow_trade(self.active)
+            self._persist_state(self.active)
 
     async def resolve_market_async(self, market: Market, winning_asset_id: str,
                                    resolved_at: datetime) -> bool:
@@ -2054,6 +2253,85 @@ class ShadowEngine:
         if self.active is state:
             self.active = None
         return True
+
+    def _market_for_live_trade(self, state: dict[str, Any]) -> Market | None:
+        market_data = state.get("resolution_market") or {}
+        try:
+            return Market(
+                venue="polymarket",
+                key=str(market_data["key"]),
+                label=str(market_data["key"]),
+                start_at=datetime.fromtimestamp(float(market_data["start_at"]), timezone.utc),
+                end_at=datetime.fromtimestamp(float(market_data["end_at"]), timezone.utc),
+                up_token=str(market_data["up_token"]),
+                down_token=str(market_data["down_token"]),
+                condition_id=str(market_data["condition_id"]),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    async def process_live_entry_reconciliation_due(self) -> int:
+        """Expire pending entries independently of market snapshots and retry GTC reconciliation."""
+        if self.live_executor is None:
+            return 0
+        now = time.time()
+        queued = 0
+        async with self._process_lock:
+            active = self.active
+            if (
+                active is not None
+                and now >= float(active.get("market_end", float("inf")))
+                and self._has_pending_live_entry(active)
+            ):
+                self._mark_live_gtc_pending_at_market_end(active, now)
+
+            for stored_state in self.store.open_shadow_trades():
+                trade_id = int(stored_state.get("trade_id", -1))
+                state = (
+                    self.active if self.active is not None
+                    and int(self.active.get("trade_id", -2)) == trade_id
+                    else stored_state
+                )
+                market = self._market_for_live_trade(state)
+                for leg in state.get("legs", []):
+                    order = leg.get("entry_order") or {}
+                    order_id = str(order.get("live_gtc_order_id") or "")
+                    if not order.get("live_gtc_pending") or not order_id:
+                        continue
+                    task = self._live_entry_tasks.get(trade_id)
+                    if task is not None and not task.done():
+                        continue
+                    due = float(order.get("live_gtc_next_poll_epoch") or 0.0)
+                    if due > now:
+                        continue
+                    if market is None:
+                        order["live_gtc_next_poll_epoch"] = now + 30.0
+                        self.store.record_runtime_event(
+                            run_id=self.run_id or "live-entry-watchdog",
+                            event_type="live_gtc_reconcile_metadata_missing",
+                            market_key=str(state.get("market_key")), venue="polymarket",
+                            details={"trade_id": trade_id, "order_id": order_id,
+                                     "retry_in_seconds": 30.0},
+                        )
+                        self._persist_state(state)
+                        continue
+                    accepted = dict(order.get("live_gtc_accepted_details")
+                                    or order.get("live_response_details") or {})
+                    accepted.setdefault("order_id", order_id)
+                    attempt_details = dict(order.get("live_gtc_attempt_details") or {})
+                    timing_context = dict(order.get("live_gtc_timing_context") or {})
+                    wait_seconds = (
+                        0.0 if order.get("live_gtc_initial_wait_completed")
+                        else float(order.get("live_gtc_wait_seconds")
+                                   or self.settings.live_buy_unfilled_ttl_seconds)
+                    )
+                    self._start_live_entry_finalization(
+                        state, leg, order, market, None, None,
+                        attempt_details, timing_context, accepted,
+                        wait_seconds=wait_seconds, resumed=True,
+                    )
+                    queued += 1
+        return queued
 
     def next_wakeup_epoch(self) -> float | None:
         """Return the next timer deadline that needs no WebSocket update."""

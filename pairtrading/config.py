@@ -26,7 +26,7 @@ class Settings:
     hold_seconds: int = 20
     min_market_time_left_seconds: int = 60
     max_hold_seconds: int = 60
-    min_shares: float = 6.0
+    min_shares: float = 5.0
     taker_fee_coefficient: float = 0.07
     # Fixed 330ms total assumed delay; keep the legacy components for stored scenarios.
     poly_order_network_ms: float = 330.0
@@ -37,7 +37,8 @@ class Settings:
     trading_mode: str = "paper"
     live_db_path: Path = Path("data/live_pair_trading.sqlite3")
     live_max_book_age_seconds: float = 2.0
-    live_buy_max_price_ticks: int = 15
+    live_buy_price_offset_ticks: int = 3
+    live_buy_unfilled_ttl_seconds: float = 2.0
     live_retry_interval_seconds: float = 1.0
     resolution_grace_seconds: float = 900.0
     discord_webhook_url: str = ""
@@ -70,7 +71,7 @@ class Settings:
                 60, _int_env("PAIR_MIN_MARKET_TIME_LEFT_SECONDS", 60, minimum=1)
             ),
             max_hold_seconds=_int_env("PAIR_MAX_HOLD_SECONDS", 60, minimum=1),
-            min_shares=_float_env("PAIR_MIN_SHARES", 6.0, minimum=1.0),
+            min_shares=_float_env("PAIR_MIN_SHARES", 5.0, minimum=1.0),
             taker_fee_coefficient=_float_env("PAIR_TAKER_FEE_COEFFICIENT", 0.07, minimum=0.0),
             poly_order_network_ms=_float_env("PAIR_POLY_ORDER_NETWORK_MS", 330.0, minimum=0.0),
             poly_order_api_ms=_float_env("PAIR_POLY_ORDER_API_MS", 0.0, minimum=0.0),
@@ -82,8 +83,11 @@ class Settings:
                 "PAIR_LIVE_DB_PATH", str(default_db.with_name("live_pair_trading.sqlite3"))
             )),
             live_max_book_age_seconds=_float_env("PAIR_LIVE_MAX_BOOK_AGE_SECONDS", 2.0, minimum=0.1),
-            live_buy_max_price_ticks=_int_env(
-                "PAIR_LIVE_BUY_MAX_PRICE_TICKS", 15, minimum=1
+            live_buy_price_offset_ticks=_int_env(
+                "PAIR_LIVE_BUY_PRICE_OFFSET_TICKS", 3, minimum=1
+            ),
+            live_buy_unfilled_ttl_seconds=_float_env(
+                "PAIR_LIVE_BUY_UNFILLED_TTL_SECONDS", 2.0, minimum=0.1
             ),
             live_retry_interval_seconds=_float_env(
                 "PAIR_LIVE_RETRY_INTERVAL_SECONDS", 1.0, minimum=0.1

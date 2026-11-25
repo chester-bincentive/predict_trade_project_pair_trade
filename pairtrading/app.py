@@ -240,12 +240,15 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
             "order_delay_ms": {"polymarket": 0 if execution_mode == "live" else
                                 settings.poly_order_network_ms + settings.poly_order_api_ms},
             "live_buy_order_type": (
-                f"pre-signed FAK market; target {settings.min_shares:g} shares; "
-                f"max_price=memory best ask+{settings.live_buy_max_price_ticks} ticks"
+                f"pre-signed GTC limit; target {settings.min_shares:g} shares; "
+                f"limit=memory best ask+{settings.live_buy_price_offset_ticks} ticks"
                 if execution_mode == "live" else None
             ),
-            "live_buy_max_price_ticks": (
-                settings.live_buy_max_price_ticks if execution_mode == "live" else None
+            "live_buy_price_offset_ticks": (
+                settings.live_buy_price_offset_ticks if execution_mode == "live" else None
+            ),
+            "live_buy_unfilled_ttl_seconds": (
+                settings.live_buy_unfilled_ttl_seconds if execution_mode == "live" else None
             ),
             "live_max_book_age_seconds": settings.live_max_book_age_seconds if execution_mode == "live" else None,
             "live_retry_interval_seconds": settings.live_retry_interval_seconds if execution_mode == "live" else None,
@@ -274,7 +277,7 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
                 market,
                 shares=settings.min_shares,
                 tick_size=tick_size,
-                max_price_ticks=settings.live_buy_max_price_ticks,
+                offset_ticks=settings.live_buy_price_offset_ticks,
             )
             details = {
                 "condition_id": market.condition_id, "tick_size": str(tick_size),
@@ -321,10 +324,11 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
     status_logger = _LiveStatusLogger()
     feed_error_logger = _FeedErrorLogger()
     if execution_mode == "live":
-        print("LIVE REAL ORDERS | Polymarket single-leg FAK orders are enabled; Binance supplies signal data only.")
-        print(f"Live execution: pre-signed BUY FAK; target={settings.min_shares:g} shares; "
-              f"max_price=best ask+{settings.live_buy_max_price_ticks} ticks; "
-              f"USDC amount=target shares × max_price, fees on top; max memory-book age="
+        print("LIVE REAL ORDERS | Polymarket single-leg GTC BUY and FAK SELL orders are enabled; Binance supplies signal data only.")
+        print(f"Live execution: pre-signed BUY GTC limit; target={settings.min_shares:g} shares; "
+              f"limit=best ask+{settings.live_buy_price_offset_ticks} ticks; "
+              f"post_only=False; cancel remainder after {settings.live_buy_unfilled_ttl_seconds:g}s; "
+              f"max memory-book age="
               f"{settings.live_max_book_age_seconds:g}s; SELL FAK floor=$0.01; ledger={db_path}.")
     else:
         print("SHADOW MODE ONLY | Polymarket single-leg paper positions; Binance supplies signal data only; no real orders are sent.")
@@ -340,7 +344,7 @@ async def _live(settings: Settings, duration: float, execution_mode: str = "pape
           f"maximum hold {settings.max_hold_seconds}s; entry requires at least "
           f"{settings.min_market_time_left_seconds}s left in the market.")
     if execution_mode == "live":
-        print("Live ledger stores trade/order events and actual FAK fills; raw quote/orderbook snapshots are not stored.")
+        print("Live ledger stores trade/order events and reconciled GTC BUY / FAK SELL fills; raw quote/orderbook snapshots are not stored.")
         print("Live max-hold exits use an independent clock; sell attempts use fresh Polymarket books only.")
     else:
         print("Paper fill events retain WebSocket source-data age; raw quote/orderbook snapshots are not stored. "
@@ -635,8 +639,8 @@ def main() -> None:
             else:
                 print("Closed/settled net PnL / win rate: n/a")
             if execution_mode == "live":
-                print("Live BUYs use a notional derived from the current memory best ask; the SDK reads "
-                      "a fresh CLOB book to derive its signed market-order price context. "
+                print("Live BUYs use a pre-signed GTC limit at signal-time best ask+configured ticks; "
+                      "unfilled remainder is canceled after the configured rest interval. "
                       "SELLs remain FAK orders; "
                       "unresolved API outcomes require account reconciliation.")
             else:

@@ -90,7 +90,7 @@ class ShadowExecutionTests(unittest.TestCase):
         }
         return PairSnapshot(self.market_key, self.poly, self.binance, books, captured, 0.0)
 
-    def test_ou_rv_entry_partial_pair_and_directional_exit(self) -> None:
+    def test_ou_rv_entry_single_leg_and_directional_exit(self) -> None:
         first = self.snapshot(self.now, self.now - timedelta(milliseconds=10), spread=-0.6)
         status = self.engine.process(first)
         self.assertIn("RV10 unavailable", status)
@@ -105,12 +105,13 @@ class ShadowExecutionTests(unittest.TestCase):
         self.assertLess(self.engine.active["ou_score"], -3.0)
         self.assertEqual(self.engine.active["ou_history_markets"], 100)
         self.assertEqual(self.engine.active["rv_history_markets"], 100)
+        self.assertEqual(len(self.engine.active["legs"]), 1)
         self.assertAlmostEqual(self.engine.active["legs"][0]["entry_order"]["arrival"],
                                signal_at.timestamp() + 0.330)
         self.assertEqual(self.engine.active["legs"][0]["entry_order"]["jitter_ms"], 0)
         self.assertEqual(self.store.db.execute(
             "SELECT COUNT(*) FROM shadow_events WHERE phase='ENTRY' AND status='SIMULATED_SUBMIT'"
-        ).fetchone()[0], 2)
+        ).fetchone()[0], 1)
 
         too_early_at = self.now + timedelta(milliseconds=200)
         status = self.engine.process(self.snapshot(
@@ -125,28 +126,13 @@ class ShadowExecutionTests(unittest.TestCase):
         status = self.engine.process(self.snapshot(
             eligible_at, signal_at, spread=-0.7, book_received_at=signal_at,
         ))
-        self.assertIn("SINGLE-LEG EXPOSURE", status)
-        self.assertEqual(self.engine.active["paired_shares"], 2.0)
-        self.assertEqual([leg["entry_filled"] for leg in self.engine.active["legs"]], [5.0, 2.0])
+        self.assertIn("OPEN position=5", status)
+        self.assertEqual(self.engine.active["paired_shares"], 5.0)
+        self.assertEqual([leg["entry_filled"] for leg in self.engine.active["legs"]], [5.0])
         self.assertAlmostEqual(
             self.engine.active["max_hold_due_epoch"],
-            max(leg["entry_fill_epoch"] for leg in self.engine.active["legs"]) + 60.0,
+            self.engine.active["legs"][0]["entry_fill_epoch"] + 60.0,
         )
-
-        unwind_arrival = self.engine.active["legs"][0]["unwind_order"]["arrival"]
-        unwind_fill_at = self.now + timedelta(seconds=2)
-        unwind_book_at = signal_at
-        self.assertGreater(unwind_fill_at.timestamp(), unwind_arrival)
-        self.assertLess(unwind_book_at.timestamp(), unwind_arrival)
-        status = self.engine.process(self.snapshot(
-            unwind_fill_at, unwind_book_at - timedelta(milliseconds=10),
-            spread=-0.7, book_received_at=unwind_book_at,
-        ))
-        self.assertEqual(
-            self.engine.active["legs"][0]["unwind_remaining"], 0.0,
-            msg=f"status={status}; leg={self.engine.active['legs'][0]}",
-        )
-        self.assertEqual(self.engine.active["legs"][1]["unwind_remaining"], 0.0)
 
         exit_trigger_at = self.now + timedelta(seconds=5)
         status = self.engine.process(self.snapshot(
@@ -173,14 +159,13 @@ class ShadowExecutionTests(unittest.TestCase):
             "SELECT status,paired_shares,net_pnl FROM shadow_trades"
         ).fetchone()
         self.assertEqual(trade["status"], "CLOSED")
-        self.assertEqual(trade["paired_shares"], 2.0)
+        self.assertEqual(trade["paired_shares"], 5.0)
         self.assertIsNotNone(trade["net_pnl"])
 
         snapshots = self.store.db.execute("SELECT COUNT(*) FROM book_snapshots").fetchone()[0]
         levels = self.store.db.execute("SELECT COUNT(*) FROM book_levels").fetchone()[0]
         self.assertEqual(snapshots, 0)
         self.assertEqual(levels, 0)
-
     def test_entry_is_skipped_with_less_than_20_seconds_left(self) -> None:
         self.market_start = self.now - timedelta(seconds=281)
         self.market_end = self.market_start + timedelta(seconds=300)
@@ -192,7 +177,7 @@ class ShadowExecutionTests(unittest.TestCase):
         status = self.engine.process(self.snapshot(
             self.now, self.now - timedelta(milliseconds=10), spread=-0.7,
         ))
-        self.assertIn("less than 20s remains", status)
+        self.assertIn("final 20s", status)
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM shadow_trades").fetchone()[0], 0)
 
 

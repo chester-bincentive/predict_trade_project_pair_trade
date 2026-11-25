@@ -415,14 +415,14 @@ class Store:
             events = self.db.execute(
                 """SELECT phase,side,status,filled_shares FROM shadow_events
                    WHERE trade_id=? AND (status='LIVE_ORDER_UNKNOWN'
-                     OR (phase='ENTRY' AND side='BUY' AND status='LIVE_FAK_NO_FILL'))""",
+                     OR (phase='ENTRY' AND side='BUY' AND status IN ('LIVE_FAK_NO_FILL','LIVE_GTC_NO_FILL')))""",
                 (row["id"],),
             ).fetchall()
             if any(event["status"] == "LIVE_ORDER_UNKNOWN" for event in events):
                 return False
             if not any(
                 event["phase"] == "ENTRY" and event["side"] == "BUY"
-                and event["status"] == "LIVE_FAK_NO_FILL"
+                and event["status"] in {"LIVE_FAK_NO_FILL", "LIVE_GTC_NO_FILL"}
                 and float(event["filled_shares"] or 0.0) <= 1e-9
                 for event in events
             ):

@@ -49,7 +49,7 @@ Discord 通知是選用功能：在 Discord 目標伺服器的「伺服器設定
 
 未設定模式時，程式仍以 paper/shadow 執行；`.env.example` 已設為 `PAIR_TRADING_MODE=live`，因此複製後會選擇真實下單模式。Live 使用 `polymarket-client==0.18.0`，私鑰由 `CREDSTORE_REGION` 與 `CREDSTORE_SECRET_NAME` 指定的 credstore 讀取，或直接填 `POLYMARKET_PRIVATE_KEY`。另外必須提供 `POLYMARKET_RELAYER_API_KEY` 與 `POLYMARKET_RELAYER_API_KEY_ADDRESS`。EOA 可不填 wallet address；proxy/smart-wallet 要填 `POLYMARKET_WALLET_ADDRESS`。範例中的憑證欄位保持空白，需自行填入有效值；沒有有效憑證時不能送單。要跑 paper/shadow，請把 `PAIR_TRADING_MODE` 改為 `paper`。
 
-Live 會先驗證 Gamma condition ID 與登入後 CLOB 的 UP/DOWN token 是否一致，並在進入訊號區前預熱 SDK 訂單 metadata、驗證與連線；CLOB book-read 與 order-post 的 HTTP/2 連線都會定期暖機。買入使用 FAK market order，`max_price` 設為最新記憶體 best ask 加 `PAIR_LIVE_BUY_MAX_PRICE_TICKS` 個市場 tick（預設 15）；USDC 預算按「目標 shares × max_price」向上取整到美分，手續費另計。市場 tick grid 在預簽池限制內時，程式會在市場就緒階段為兩個 token 預簽各個可能的價格上限；若池未就緒或 tick grid 過大，則使用同一 `max_price` 保護路徑即時簽名。兩種路徑都不需要在訊號後讀取 CLOB `/book`。明確 FAK 未撮合時，程式重讀最新記憶體簿；若 best ask 未超過首次訊號的 `max_price`，沿用原上限與 USDC 預算最多重試一次，超過上限就記錄跳過、不追價。逾時、取消或回覆不完整則標為未知，不會自動重送。
+Live 買單改為預簽 GTC 限價單：訊號觸發時，限價為當下 best ask + `PAIR_LIVE_BUY_PRICE_OFFSET_TICKS`（預設 3 tick），數量 5 股，`post_only=False`。未成交餘單保留 `PAIR_LIVE_BUY_UNFILLED_TTL_SECONDS`（預設 2 秒）後撤單。tick 格點符合且預簽池已備妥時，訊號前完成簽名；撤單後會核對訂單最終狀態及實際成交紀錄，無法確認時暫停該 condition 以防重複下單。若價格超出合法 tick 格點或市場最小下單股數大於 5，會略過該次買單。ask+3 tick 是可穿價限價，可能立即成交；未成交餘量最多保留 2 秒。
 
 賣出使用 exact-share FAK，限價設為 $0.01，讓可成交的剩餘持倉盡量立即賣出；FAK 明確未成交或部分成交時，立即用最新記憶體簿重送剩餘股數，不等冷卻時間或下一筆 WebSocket 更新。若目前沒有可用 bid、報價過期或市場驗證失敗，則等可用簿更新後再送。委託前會檢查簿的更新年齡（`PAIR_LIVE_MAX_BOOK_AGE_SECONDS`，預設 2 秒）與市場最後 60 秒限制。每次 intent 會先寫入資料庫，再呼叫 CLOB；簽名、SDK POST、HTTP 回應和回報耗時也會寫入交易事件。
 

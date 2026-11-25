@@ -101,37 +101,26 @@ def _partial_sweep(book: Book, *, side: str, shares: float, fee_coefficient: flo
     return filled, notional, fee
 
 
-def _live_market_buy_max_price(
+def _live_buy_limit_price(
     best_ask: float,
     tick_size: Decimal | str,
-    max_price_ticks: int,
+    offset_ticks: int,
 ) -> Decimal | None:
-    """Add the configured number of ticks to the current ask, capped at 1-tick."""
+    """Return the exact ask-plus-ticks BUY limit when it remains on the legal tick grid."""
     ask = Decimal(str(best_ask))
     tick = Decimal(str(tick_size))
     if (
         not ask.is_finite() or not tick.is_finite()
         or not Decimal("0") < ask < 1 or not Decimal("0") < tick < 1
-        or max_price_ticks < 1
+        or offset_ticks < 1
     ):
         return None
-    max_level = int((Decimal("1") - tick) // tick)
+    max_price_level = int((Decimal("1") - tick) // tick)
     ask_level = int((ask / tick).to_integral_value(rounding=ROUND_UP))
-    cap_level = min(ask_level + max_price_ticks, max_level)
-    if cap_level < ask_level:
+    price_level = ask_level + offset_ticks
+    if price_level > max_price_level:
         return None
-    return tick * cap_level
-
-
-def _live_market_buy_amount(requested_shares: float, max_price: Decimal | str) -> Decimal | None:
-    """Round up the USDC budget so a protected FAK can buy the target at its cap."""
-    shares = Decimal(str(requested_shares))
-    cap = Decimal(str(max_price))
-    if not shares.is_finite() or not cap.is_finite() or shares <= 0 or not Decimal("0") < cap < 1:
-        return None
-    amount = (shares * cap).quantize(Decimal("0.01"), rounding=ROUND_UP)
-    return amount if amount > 0 else None
-
+    return tick * price_level
 
 class ShadowEngine:
     """Single-leg paper runner with an explicitly armed Polymarket live path."""
@@ -171,6 +160,9 @@ class ShadowEngine:
         self.current_book_provider: Callable[[str, str], Book | None] | None = None
         self._process_lock = asyncio.Lock()
         self._live_exit_task: asyncio.Task[None] | None = None
+        self._live_entry_task: asyncio.Task[None] | None = None
+        self._live_entry_order: dict[str, Any] | None = None
+        self._live_entry_trade_id: int | None = None
         self._live_exit_inflight_trade_id: int | None = None
         self._live_presign_tasks: set[asyncio.Task[None]] = set()
         if live_executor is not None and self.active is not None:
@@ -376,7 +368,7 @@ class ShadowEngine:
             "exit=directional-ou-threshold-or-maxhold;"
             f"rvroll={self.settings.rv_history_window_markets};"
             f"rvmin={self.settings.min_rv_history_markets};"
-            f"livebuy={'fak-market-no-explicit-max-price' if self.live_executor is not None else 'n/a'};"
+            f"livebuy={'gtc-limit-ask-plus-' + str(self.settings.live_buy_price_offset_ticks) + 'ticks-ttl-' + str(self.settings.live_buy_unfilled_ttl_seconds) + 's' if self.live_executor is not None else 'n/a'};"
 
             f"poly={self.settings.poly_order_network_ms:g}+{self.settings.poly_order_api_ms:g};"
             f"binance={self.settings.binance_order_network_ms:g}+{self.settings.binance_order_api_ms:g};"
@@ -433,7 +425,7 @@ class ShadowEngine:
                 f"n={ou_stats.count} model={ou_stats.method}; Polymarket {chosen[0][1]}="
                 f"{self.settings.min_shares:g} shares; RV10={rv10:.6f}>q90={rv_q90:.6f} "
                 f"(n={rv_history_n}); "
-                f"{('immediate live FAK uses current memory book' if self.live_executor is not None else 'fixed-delay IOC uses memory book at arrival')}; "
+                f"{('pre-signed live GTC limit uses signal-time best ask plus the configured tick offset' if self.live_executor is not None else 'fixed-delay IOC uses memory book at arrival')}; "
                 f"{('real FAK execution enabled' if self.live_executor is not None else 'no real orders sent')}; "
                 f"{delay_text}")
         if self.live_executor is not None:
@@ -520,7 +512,7 @@ class ShadowEngine:
         self._event(state, phase, leg, side="BUY" if phase == "ENTRY" else "SELL",
                     status="LIVE_ORDER_READY" if live else "SIMULATED_SUBMIT",
                     requested=requested, order=order,
-                    details={"note": "actual Polymarket FAK will be sent when due" if live
+                    details={"note": "a pre-signed Polymarket GTC BUY will be posted when due" if live
                              else "assumed latency only; no API order request was sent",
                              "execution": "wait-for-new-book" if wait_for_update
                              else "immediate-live-submit" if live
@@ -567,6 +559,10 @@ class ShadowEngine:
             if order.get("live_result_recorded"):
                 result = order["live_result"]
                 return float(result["filled"]), float(result["notional"]), float(result["fee"])
+            if order.get("live_gtc_pending"):
+                if self._live_entry_worker_running(order):
+                    order["live_gtc_next_poll_epoch"] = time.time() + 0.25
+                    return None
             if order.get("live_api_started"):
                 state["live_order_unknown"] = True
                 state["live_order_unknown_phase"] = phase
@@ -582,7 +578,7 @@ class ShadowEngine:
         wait_for_update = bool(order.get("wait_for_update", False))
         if self.live_executor is not None:
             # Live orders use the newest in-memory book as soon as the strategy
-            # evaluates it. Only a retry waits for its cooldown and a later book.
+            # evaluates it. Exit retries wait for their cooldown and a later book.
             if book is None:
                 if wait_for_update and time.time() + 1e-6 < order["arrival"]:
                     return None
@@ -720,8 +716,6 @@ class ShadowEngine:
                             details={"book_age_ms": round(live_book_age * 1000.0, 3),
                                      "max_book_age_ms": self.settings.live_max_book_age_seconds * 1000.0})
                 return 0.0, 0.0, 0.0
-            market_amount_usdc: Decimal | None = None
-            buy_max_price: Decimal | None = None
             limit_price: Decimal | None = None
             if phase == "ENTRY":
                 min_live_shares = max(5.0, self.settings.min_shares,
@@ -735,7 +729,9 @@ class ShadowEngine:
                                 requested=remaining, filled=0.0, notional=0.0, fee=0.0,
                                 book=book, snapshot_id=snapshot_ids.get((leg["venue"], leg["outcome"])),
                                 order=order,
-                                details={"minimum_live_shares": min_live_shares})
+                                details={"requested_shares": remaining,
+                                         "market_minimum_shares": float(market.min_order_size),
+                                         "configured_shares": self.settings.min_shares})
                     return 0.0, 0.0, 0.0
                 if book.best_ask is None:
                     order["live_result_recorded"] = True
@@ -747,26 +743,23 @@ class ShadowEngine:
                                 book=book, snapshot_id=snapshot_ids.get((leg["venue"], leg["outcome"])),
                                 order=order, details={"reason": "no visible ask in current memory book"})
                     return 0.0, 0.0, 0.0
-                buy_max_price = _live_market_buy_max_price(
+                limit_price = _live_buy_limit_price(
                     book.best_ask.price, tick_size,
-                    self.settings.live_buy_max_price_ticks,
+                    self.settings.live_buy_price_offset_ticks,
                 )
-                market_amount_usdc = (
-                    None if buy_max_price is None
-                    else _live_market_buy_amount(remaining, buy_max_price)
-                )
-                if buy_max_price is None or market_amount_usdc is None:
+                if limit_price is None:
                     order["live_result_recorded"] = True
                     order["live_result"] = {"filled": 0.0, "notional": 0.0, "fee": 0.0}
-                    order["live_block_reason"] = "invalid_market_buy_notional"
+                    order["live_block_reason"] = "invalid_or_out_of_range_buy_limit_price"
                     self._persist()
                     self._event(state, phase, leg, side=side,
-                                status="LIVE_ENTRY_AMOUNT_INVALID",
+                                status="LIVE_ENTRY_LIMIT_PRICE_INVALID",
                                 requested=remaining, filled=0.0, notional=0.0, fee=0.0,
                                 book=book, order=order,
                                 details={"best_ask": book.best_ask.price,
                                          "requested_shares": remaining,
-                                         "max_price_ticks": self.settings.live_buy_max_price_ticks})
+                                         "offset_ticks": self.settings.live_buy_price_offset_ticks,
+                                         "tick_size": str(tick_size)})
                     return 0.0, 0.0, 0.0
             else:
                 limit_price = Decimal("0.01")
@@ -811,7 +804,9 @@ class ShadowEngine:
                                          "estimated_book_notional": estimated_notional})
                     return 0.0, 0.0, 0.0
             intent_details = {
-                "execution_mode": "live", "order_type": "FAK", "asset_id": leg["token_id"],
+                "execution_mode": "live",
+                "order_type": "GTC" if phase == "ENTRY" else "FAK",
+                "asset_id": leg["token_id"],
                 "requested_shares": remaining,
                 "post_only": False,
                 "book_received_at": book.received_at.timestamp(),
@@ -821,28 +816,24 @@ class ShadowEngine:
                 "fee_accounting": "configured_fee_formula_applied_to_live_vwap",
             }
             if phase == "ENTRY":
-                assert (market_amount_usdc is not None and buy_max_price is not None
-                        and book.best_ask is not None)
+                assert limit_price is not None and book.best_ask is not None
                 intent_details.update({
-                    "market_buy_amount_usdc": format(market_amount_usdc, "f"),
-                    "market_buy_amount_basis": "requested_shares_times_max_price",
-                    "market_buy_max_price": format(buy_max_price, "f"),
-                    "market_buy_max_price_ticks": self.settings.live_buy_max_price_ticks,
-                    "sdk_price_context_source": "explicit_max_price_no_fresh_book",
-                    "sdk_explicit_max_price": True,
+                    "best_ask": format(Decimal(str(book.best_ask.price)), "f"),
+                    "limit_price": format(limit_price, "f"),
+                    "limit_price_basis": "signal_time_best_ask_plus_configured_ticks",
+                    "limit_price_offset_ticks": self.settings.live_buy_price_offset_ticks,
+                    "unfilled_remainder_seconds": self.settings.live_buy_unfilled_ttl_seconds,
                     "nominal_share_target": remaining,
-                    "memory_best_ask": book.best_ask.price,
                 })
             else:
                 intent_details.update({
                     "limit_price": str(limit_price),
                     "limit_price_basis": "0.01_marketable_sell_floor",
                 })
-            max_attempts = 2 if phase == "ENTRY" else 1
+            max_attempts = 1
             for attempt_number in range(1, max_attempts + 1):
+                now = datetime.now(timezone.utc)
                 if attempt_number == 2:
-                    book = self._current_book(snapshot, leg)
-                    now = datetime.now(timezone.utc)
                     seconds_left = float(state["market_end"]) - now.timestamp()
                     if (book is None or book.best_ask is None
                             or seconds_left <= self.settings.min_market_time_left_seconds
@@ -947,15 +938,47 @@ class ShadowEngine:
 
                 try:
                     if phase == "ENTRY":
-                        assert market_amount_usdc is not None and buy_max_price is not None
-                        accepted, fill, response_details = await self.live_executor.buy_fak(
+                        assert limit_price is not None and tick_size is not None
+                        accepted, order_id, response_details = await self.live_executor.buy_gtc_limit(
                             asset_id=leg["token_id"], requested_qty=remaining,
-                            market_amount_usdc=market_amount_usdc,
-                            max_price=buy_max_price,
-                            tick_size=tick_size,
+                            limit_price=limit_price, tick_size=tick_size,
                             on_order_signed=record_signed_order,
                             timing_context=timing_context,
                         )
+                        if accepted:
+                            assert order_id is not None
+                            response_details["order_id"] = order_id
+                            response_details["rest_seconds"] = self.settings.live_buy_unfilled_ttl_seconds
+                            self._queue_live_entry_finalization(
+                                state, leg, order, market, book,
+                                snapshot_ids.get((leg["venue"], leg["outcome"])),
+                                attempt_details, timing_context, response_details,
+                            )
+                            self._event(
+                                state, phase, leg, side="BUY", status="LIVE_GTC_ACCEPTED",
+                                requested=remaining, book=book,
+                                snapshot_id=snapshot_ids.get((leg["venue"], leg["outcome"])),
+                                order=order,
+                                details={**attempt_details, **response_details,
+                                         "note": "unfilled remainder will be canceled after the configured rest interval"},
+                            )
+                            self._persist()
+                            return None
+                        details = {**attempt_details, **response_details,
+                                   "outcome_unknown": False,
+                                   "live_order_timing": dict(timing_context)}
+                        order["live_result_recorded"] = True
+                        order["live_result"] = {"filled": 0.0, "notional": 0.0, "fee": 0.0}
+                        order["live_response_details"] = details
+                        self._event(
+                            state, phase, leg, side="BUY", status="LIVE_GTC_REJECTED",
+                            requested=remaining, filled=0.0, notional=0.0, fee=0.0,
+                            book=book,
+                            snapshot_id=snapshot_ids.get((leg["venue"], leg["outcome"])),
+                            order=order, details=details,
+                        )
+                        self._persist()
+                        return 0.0, 0.0, 0.0
                     else:
                         accepted, fill, response_details = await self.live_executor.sell_fak(
                             asset_id=leg["token_id"], requested_qty=remaining,
@@ -1122,6 +1145,183 @@ class ShadowEngine:
 
         task.add_done_callback(discard_finished)
 
+    def _live_entry_worker_running(self, order: dict[str, Any]) -> bool:
+        return (
+            self._live_entry_order is order
+            and self._live_entry_task is not None
+            and not self._live_entry_task.done()
+        )
+
+    def _queue_live_entry_finalization(
+        self,
+        state: dict[str, Any],
+        leg: dict[str, Any],
+        order: dict[str, Any],
+        market: Market,
+        book: Book,
+        snapshot_id: int | None,
+        attempt_details: dict[str, Any],
+        timing_context: dict[str, Any],
+        accepted_details: dict[str, Any],
+    ) -> None:
+        if self.live_executor is None:
+            raise RuntimeError("live entry finalization requires a connected executor")
+        if self._live_entry_task is not None and not self._live_entry_task.done():
+            raise LiveOrderUnknown(
+                "another live GTC entry finalizer is still active",
+                diagnostic_fields={"order_id": accepted_details.get("order_id")},
+            )
+        trade_id = int(state["trade_id"])
+        order_id = str(accepted_details["order_id"])
+        order["live_gtc_pending"] = True
+        order["live_gtc_order_id"] = order_id
+        order["live_gtc_wait_seconds"] = self.settings.live_buy_unfilled_ttl_seconds
+        order["live_gtc_next_poll_epoch"] = (
+            time.time() + self.settings.live_buy_unfilled_ttl_seconds + 0.1
+        )
+        self._live_entry_trade_id = trade_id
+        self._live_entry_order = order
+        self.store.record_runtime_event(
+            run_id=self.run_id or "live-entry-worker",
+            event_type="live_entry_worker_queued",
+            market_key=str(state["market_key"]),
+            venue="polymarket",
+            details={
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "leg": str(leg["name"]),
+                "wait_seconds": self.settings.live_buy_unfilled_ttl_seconds,
+            },
+        )
+        task = asyncio.create_task(
+            self._run_live_entry_finalization(
+                state, leg, order, market, book, snapshot_id,
+                attempt_details, timing_context, accepted_details,
+            ),
+            name=f"live-entry-order-{trade_id}",
+        )
+        self._live_entry_task = task
+
+        def report_worker_error(done: asyncio.Task[None]) -> None:
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                print(f"LIVE ENTRY WORKER ERROR ({type(error).__name__}); order state retained", flush=True)
+
+        task.add_done_callback(report_worker_error)
+
+    async def _run_live_entry_finalization(
+        self,
+        state: dict[str, Any],
+        leg: dict[str, Any],
+        order: dict[str, Any],
+        market: Market,
+        book: Book,
+        snapshot_id: int | None,
+        attempt_details: dict[str, Any],
+        timing_context: dict[str, Any],
+        accepted_details: dict[str, Any],
+    ) -> None:
+        assert self.live_executor is not None
+        order_id = str(accepted_details["order_id"])
+        try:
+            fill, reconciliation = await self.live_executor.cancel_and_reconcile_gtc_buy(
+                order_id=order_id,
+                asset_id=str(leg["token_id"]),
+                condition_id=str(market.condition_id),
+                requested_qty=float(order["requested"]),
+                wait_seconds=self.settings.live_buy_unfilled_ttl_seconds,
+            )
+        except asyncio.CancelledError:
+            async with self._process_lock:
+                if self.active is state:
+                    state["live_order_unknown"] = True
+                    state["live_order_unknown_phase"] = "ENTRY"
+                    state["status"] = "UNRESOLVED_LIVE_ORDER"
+                    order["live_unknown"] = True
+                    order["live_gtc_pending"] = False
+                    self._event(
+                        state, "ENTRY", leg, side="BUY", status="LIVE_ORDER_UNKNOWN",
+                        requested=float(order["requested"]), book=book,
+                        snapshot_id=snapshot_id, order=order,
+                        details={
+                            **attempt_details, **timing_context,
+                            "order_id": order_id,
+                            "reason": "entry finalizer stopped before cancel/reconciliation completed",
+                        },
+                    )
+                    self._persist()
+            raise
+        except Exception as exc:
+            async with self._process_lock:
+                if self.active is state:
+                    state["live_order_unknown"] = True
+                    state["live_order_unknown_phase"] = "ENTRY"
+                    state["status"] = "UNRESOLVED_LIVE_ORDER"
+                    order["live_unknown"] = True
+                    order["live_gtc_pending"] = False
+                    self._event(
+                        state, "ENTRY", leg, side="BUY", status="LIVE_ORDER_UNKNOWN",
+                        requested=float(order["requested"]), book=book,
+                        snapshot_id=snapshot_id, order=order,
+                        details={
+                            **attempt_details, **timing_context,
+                            **getattr(exc, "diagnostic_fields", {}),
+                            "order_id": order_id,
+                            "error_type": type(exc).__name__,
+                            "reason": "GTC cancel or fill reconciliation did not reach a definitive result",
+                        },
+                    )
+                    self._persist()
+            return
+
+        async with self._process_lock:
+            if self.active is not state:
+                return
+            filled = 0.0 if fill is None else float(fill.filled_qty)
+            notional = 0.0 if fill is None else float(fill.notional)
+            fee = 0.0 if fill is None else float(fill.fee)
+            order["live_gtc_pending"] = False
+            order["live_result_recorded"] = True
+            order["live_result"] = {"filled": filled, "notional": notional, "fee": fee}
+            order["live_accepted"] = True
+            order["live_fill_epoch"] = time.time() if filled > 1e-9 else None
+            order["live_response_details"] = {**accepted_details, **reconciliation}
+            status = (
+                "LIVE_GTC_NO_FILL" if filled <= 1e-9
+                else "LIVE_GTC_PARTIAL_CANCELED"
+                if filled + 1e-9 < float(order["requested"])
+                else "LIVE_GTC_FILLED"
+            )
+            self._event(
+                state, "ENTRY", leg, side="BUY", status=status,
+                requested=float(order["requested"]), filled=filled,
+                notional=notional, fee=fee, book=book,
+                snapshot_id=snapshot_id, order=order,
+                details={
+                    **attempt_details, **accepted_details, **reconciliation,
+                    "remaining_canceled": max(0.0, float(order["requested"]) - filled),
+                    "live_order_timing": dict(timing_context),
+                },
+            )
+            self.store.record_runtime_event(
+                run_id=self.run_id or "live-entry-worker",
+                event_type="live_entry_worker_finished",
+                market_key=str(state["market_key"]),
+                venue="polymarket",
+                details={
+                    "trade_id": int(state["trade_id"]),
+                    "order_id": order_id,
+                    "filled_shares": filled,
+                    "status": status,
+                },
+            )
+            self._persist()
+            await self._advance(
+                None, {}, int(state.get("bucket", 0)), None,
+                market=market, captured_at=datetime.now(timezone.utc),
+            )
     def _queue_live_exit_attempt(
         self, state: dict[str, Any], leg: dict[str, Any],
         order: dict[str, Any], market: Market,
@@ -1369,6 +1569,16 @@ class ShadowEngine:
                     )
 
     async def stop_live_background_tasks(self) -> None:
+        entry_task = self._live_entry_task
+        if entry_task is not None and not entry_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(entry_task),
+                    timeout=max(10.0, self.settings.live_buy_unfilled_ttl_seconds + 8.0),
+                )
+            except asyncio.TimeoutError:
+                entry_task.cancel()
+                await asyncio.gather(entry_task, return_exceptions=True)
         tasks: list[asyncio.Task[Any]] = []
         if self._live_exit_task is not None and not self._live_exit_task.done():
             tasks.append(self._live_exit_task)
@@ -1680,16 +1890,16 @@ class ShadowEngine:
                     return (f"{self._status_prefix} {state['status']} {state['signal']} "
                             f"position={state['paired_shares']:g}/{state['requested_shares']:g} "
                             f"netPnL=${state['net_pnl']:+.4f}; Polymarket only; "
-                            f"{'real FAK fills' if self.live_executor is not None else 'paper fills'}")
+                            f"{'real Polymarket fills' if self.live_executor is not None else 'paper fills'}")
                 return (f"{self._status_prefix} {state['status']} {state['signal']} paired={state['paired_shares']:g}/"
                         f"{state['requested_shares']:g} netPnL=${state['net_pnl']:+.4f}; "
-                        f"{'real FAK fills' if self.live_executor is not None else 'no real orders sent'}")
+                        f"{'real Polymarket fills' if self.live_executor is not None else 'no real orders sent'}")
 
         if dirty:
             self._persist()
         if not state["entries_resolved"]:
             done = sum(bool(leg["entry_attempted"]) for leg in state["legs"])
-            return (f"{self._status_prefix} ENTRY pending {done}/1 Polymarket order; waiting for order response"
+            return (f"{self._status_prefix} ENTRY pending {done}/1 Polymarket order; waiting for GTC cancel and fill reconciliation"
                     if state.get("execution_mode") == "polymarket_only"
                     else f"{self._status_prefix} ENTRY pending {done}/2 legs; waiting for 330ms order arrival")
         if any(float(leg["unwind_remaining"]) > 1e-9 for leg in state["legs"]):

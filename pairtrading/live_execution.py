@@ -169,7 +169,7 @@ def _signed_order_diagnostics(signed_order: Any, side: str) -> dict[str, Any]:
 
 
 class PolymarketLiveExecutor:
-    """Authenticated FAK execution through Polymarket's unified Python SDK."""
+    """Authenticated Polymarket order execution through the unified Python SDK."""
 
     _HTTP_KEEPALIVE_INTERVAL_SECONDS = 20.0
     _HTTP_KEEPALIVE_WARNING_INTERVAL_SECONDS = 300.0
@@ -351,16 +351,11 @@ class PolymarketLiveExecutor:
             await asyncio.sleep(1.0)
             if self.client is None or market.end_ns <= time.time_ns():
                 return
-            signed_order = await self.client.create_market_order(
-                asset_id=key[0],
-                side="BUY",
-                amount=format(_market_buy_amount_for_shares(size, key[2]), "f"),
-                max_price=key[2],
-                order_type="FAK",
+            signed_order = await self.client.create_limit_order(
+                asset_id=key[0], side="BUY", price=key[2], size=size, post_only=False,
             )
-            fak_order = replace(signed_order, order_type="FAK")
             if self.client is not None and market.end_ns > time.time_ns():
-                self._prepared_buy_orders.setdefault(key, (fak_order, market.end_ns, pool_key))
+                self._prepared_buy_orders.setdefault(key, (signed_order, market.end_ns, pool_key))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -455,9 +450,9 @@ class PolymarketLiveExecutor:
         *,
         shares: float,
         tick_size: Decimal | str,
-        max_price_ticks: int = 15,
+        offset_ticks: int = 3,
     ) -> dict[str, Any]:
-        """Pre-sign protected BUY FAKs for each possible ask-derived max price."""
+        """Pre-sign BUY GTC limit orders for each possible ask-derived limit price."""
         if self.client is None:
             raise RuntimeError("Polymarket account is not connected")
         self._prune_expired_prepared_buy_orders()
@@ -465,24 +460,24 @@ class PolymarketLiveExecutor:
         tick = Decimal(str(tick_size))
         if not tick.is_finite() or tick <= 0 or tick >= 1:
             raise ValueError("market tick size must be between 0 and 1")
-        if max_price_ticks < 1:
-            raise ValueError("max_price_ticks must be at least one")
+        if offset_ticks < 1:
+            raise ValueError("offset_ticks must be at least one")
         pool_key = (
-            market.condition_id.lower(), size, format(tick, "f"), str(max_price_ticks)
+            market.condition_id.lower(), size, format(tick, "f"), str(offset_ticks)
         )
         if pool_key in self._prepared_buy_pool_ready:
             return {
                 "status": "already_ready",
                 "prepared_orders": 0,
                 "tick_size": format(tick, "f"),
-                "max_price_ticks": max_price_ticks,
+                "offset_ticks": offset_ticks,
             }
         if pool_key in self._prepared_buy_pool_preparing:
             return {
                 "status": "already_preparing",
                 "prepared_orders": 0,
                 "tick_size": format(tick, "f"),
-                "max_price_ticks": max_price_ticks,
+                "offset_ticks": offset_ticks,
             }
 
         verified = self._verified_markets.get(market.condition_id.lower())
@@ -493,17 +488,16 @@ class PolymarketLiveExecutor:
         ):
             raise ValueError("market condition and outcome assets must be account-verified before presigning")
         self._prepared_buy_pool_preparing.add(pool_key)
-        self._prepared_buy_pool_specs[pool_key] = (market, size, tick, max_price_ticks)
+        self._prepared_buy_pool_specs[pool_key] = (market, size, tick, offset_ticks)
         started_ns = time.perf_counter_ns()
         prepared_count = 0
         try:
             max_price_level = int((Decimal("1") - tick) // tick)
-            if max_price_level < 1:
-                raise ValueError("market tick size leaves no legal BUY max_price")
-            max_legal_price = tick * max_price_level
+            if max_price_level <= offset_ticks:
+                raise ValueError("tick size and offset leave no legal BUY limit price")
             max_price_levels = sorted({
-                tick * min(ask_level + max_price_ticks, max_price_level)
-                for ask_level in range(1, max_price_level + 1)
+                tick * (ask_level + offset_ticks)
+                for ask_level in range(1, max_price_level - offset_ticks + 1)
             })
             candidate_count = len(max_price_levels) * 2
             if candidate_count > self._MAX_PREPARED_BUY_ORDERS_PER_MARKET:
@@ -514,7 +508,7 @@ class PolymarketLiveExecutor:
                     "candidate_orders": candidate_count,
                     "candidate_limit": self._MAX_PREPARED_BUY_ORDERS_PER_MARKET,
                     "tick_size": format(tick, "f"),
-                    "max_price_ticks": max_price_ticks,
+                    "offset_ticks": offset_ticks,
                     "prepare_elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
                 }
 
@@ -527,18 +521,10 @@ class PolymarketLiveExecutor:
                     key = self._prepared_buy_order_key(asset_id, size, price_text)
                     if key in self._prepared_buy_orders:
                         continue
-                    signed_order = await self.client.create_market_order(
-                        asset_id=asset_id,
-                        side="BUY",
-                        amount=format(_market_buy_amount_for_shares(size, price), "f"),
-                        max_price=price_text,
-                        order_type="FAK",
+                    signed_order = await self.client.create_limit_order(
+                        asset_id=asset_id, side="BUY", price=price_text, size=size, post_only=False,
                     )
-                    self._prepared_buy_orders[key] = (
-                        replace(signed_order, order_type="FAK"),
-                        market.end_ns,
-                        pool_key,
-                    )
+                    self._prepared_buy_orders[key] = (signed_order, market.end_ns, pool_key)
                     prepared_count += 1
                     if prepared_count % self._PREPARED_BUY_ORDER_YIELD_EVERY == 0:
                         await asyncio.sleep(0)
@@ -548,9 +534,9 @@ class PolymarketLiveExecutor:
                 "prepared_orders": prepared_count,
                 "max_price_levels_per_asset": len(max_price_levels),
                 "tick_size": format(tick, "f"),
-                "max_price_ticks": max_price_ticks,
-                "minimum_max_price": format(min(max_price_levels), "f"),
-                "maximum_max_price": format(min(max_price_levels[-1], max_legal_price), "f"),
+                "offset_ticks": offset_ticks,
+                "minimum_limit_price": format(min(max_price_levels), "f"),
+                "maximum_limit_price": format(max_price_levels[-1], "f"),
                 "prepare_elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
             }
         finally:
@@ -1035,6 +1021,345 @@ class PolymarketLiveExecutor:
         )
         return result
 
+    async def buy_gtc_limit(
+        self,
+        *,
+        asset_id: str,
+        requested_qty: float,
+        limit_price: Decimal | str | float,
+        tick_size: Decimal | str,
+        on_order_signed: Callable[[dict[str, Any]], None] | None = None,
+        timing_context: dict[str, Any] | None = None,
+    ) -> tuple[bool, str | None, dict[str, Any]]:
+        """Post a pre-signed or locally signed BUY GTC limit order."""
+        if self.client is None:
+            raise RuntimeError("Polymarket account is not connected")
+        price = Decimal(str(limit_price))
+        tick = Decimal(str(tick_size))
+        size_text = f"{requested_qty:.6f}"
+        if (
+            not price.is_finite() or not Decimal("0") < price < 1
+            or not tick.is_finite() or tick <= 0 or tick >= 1 or price % tick != 0
+            or requested_qty <= 0
+        ):
+            raise ValueError("BUY GTC price, tick size, and share quantity must be valid")
+        trace: dict[str, Any] = {
+            "phase": "order",
+            "post_http_attempts": [],
+            "metadata_http_attempts": [],
+            "market_book_http_attempts": [],
+            "export_target": timing_context,
+        }
+        token = _ACTIVE_ORDER_TRACE.set(trace)
+        started_ns = time.perf_counter_ns()
+        try:
+            signed_order = self._take_prepared_buy_order(asset_id, size_text, price)
+            if signed_order is not None:
+                source = "pre_signed_gtc_buy_pool"
+            else:
+                signed_order = await self.client.create_limit_order(
+                    asset_id=asset_id,
+                    side="BUY",
+                    price=format(price, "f"),
+                    size=size_text,
+                    post_only=False,
+                )
+                source = "on_demand_gtc_limit_sign"
+            signed_order_type = str(_field(signed_order, "order_type", default="")).upper()
+            signed_post_only = bool(_field(signed_order, "post_only", default=False))
+            if signed_order_type != "GTC" or signed_post_only:
+                raise ValueError("prepared BUY order must be GTC with post_only=False")
+            trace["order_prepare_source"] = source
+            signed_details = _signed_order_diagnostics(signed_order, "BUY")
+            signed_details.update({
+                "sdk_order_type": signed_order_type,
+                "sdk_post_only": signed_post_only,
+                "sdk_limit_price": format(price, "f"),
+                "sdk_requested_share_qty": size_text,
+                "sdk_order_prepare_source": source,
+                "sdk_tick_size": format(tick, "f"),
+            })
+            if on_order_signed is not None:
+                on_order_signed(signed_details)
+        except asyncio.CancelledError:
+            trace["order_create_ms"] = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+            self._finish_incomplete_http_attempts(trace)
+            self._export_order_timing(trace)
+            _ACTIVE_ORDER_TRACE.reset(token)
+            raise
+        except Exception as exc:
+            trace["order_create_ms"] = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+            self._finish_incomplete_http_attempts(trace)
+            self._export_order_timing(trace)
+            _ACTIVE_ORDER_TRACE.reset(token)
+            details = _request_rejection_diagnostics(exc)
+            details.update({
+                "sdk_order_stage": "create_limit_order",
+                "sdk_limit_price": format(price, "f"),
+                "sdk_requested_share_qty": size_text,
+                "outcome_unknown": False,
+                "error_type": type(exc).__name__,
+                "error_message": _safe_diagnostic_text(exc),
+                "live_order_timing": dict(timing_context or {}),
+            })
+            logger.error("LIVE_CLOB_GTC_BUY_PREPARATION_FAILED error_type=%s", type(exc).__name__)
+            return False, None, details
+
+        trace["order_create_ms"] = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        self._export_order_timing(trace)
+        if timing_context is not None:
+            timing_context["order_prepare_source"] = source
+        try:
+            post_started_ns = time.perf_counter_ns()
+            response = await self.client.post_order(signed_order)
+            trace["sdk_post_order_call_ms"] = (
+                time.perf_counter_ns() - post_started_ns
+            ) / 1_000_000.0
+            self._export_order_timing(trace)
+        except asyncio.CancelledError:
+            if "post_started_ns" in locals():
+                trace["sdk_post_order_call_ms"] = (
+                    time.perf_counter_ns() - post_started_ns
+                ) / 1_000_000.0
+            self._finish_incomplete_http_attempts(trace)
+            self._export_order_timing(trace)
+            _ACTIVE_ORDER_TRACE.reset(token)
+            raise
+        except Exception as exc:
+            if "post_started_ns" in locals():
+                trace["sdk_post_order_call_ms"] = (
+                    time.perf_counter_ns() - post_started_ns
+                ) / 1_000_000.0
+            self._finish_incomplete_http_attempts(trace)
+            self._export_order_timing(trace)
+            _ACTIVE_ORDER_TRACE.reset(token)
+            details = _request_rejection_diagnostics(exc)
+            details.update(signed_details)
+            details.update({
+                "sdk_order_stage": "post_order",
+                "outcome_unknown": True,
+                "live_order_timing": dict(timing_context or {}),
+            })
+            raise LiveOrderUnknown(
+                f"BUY GTC POST outcome is unknown ({type(exc).__name__})",
+                diagnostic_fields=details,
+            ) from exc
+
+        order_id = _field(response, "order_id", "orderId", "id")
+        status = str(_field(response, "status", default="unknown") or "unknown").lower()
+        accepted = bool(_field(response, "ok", "success", default=False)) or order_id is not None
+        details = {
+            "order_id": None if order_id is None else str(order_id),
+            "order_status": status,
+            "trade_ids": [
+                str(item)
+                for item in (_field(response, "trade_ids", "tradeIds", default=()) or ())
+            ],
+            "rejection_code": _field(response, "code"),
+            "rejection_message": _field(response, "message", "error_msg", "errorMsg"),
+            "outcome_unknown": False,
+            **signed_details,
+            "live_order_timing": dict(timing_context or {}),
+        }
+        _ACTIVE_ORDER_TRACE.reset(token)
+        if not accepted:
+            return False, None, details
+        if order_id is None:
+            details["outcome_unknown"] = True
+            raise LiveOrderUnknown(
+                "accepted BUY GTC response omitted its order ID",
+                diagnostic_fields=details,
+            )
+        return True, str(order_id), details
+
+    async def cancel_and_reconcile_gtc_buy(
+        self,
+        *,
+        order_id: str,
+        asset_id: str,
+        condition_id: str,
+        requested_qty: float,
+        wait_seconds: float,
+    ) -> tuple[Fill | None, dict[str, Any]]:
+        """Keep a BUY GTC remainder live for the requested interval, then cancel and reconcile."""
+        if self.client is None:
+            raise LiveOrderUnknown("Polymarket account is not connected during GTC reconciliation")
+        await asyncio.sleep(max(0.0, float(wait_seconds)))
+        cancel_error: str | None = None
+        try:
+            cancel_response = await self.client.cancel_order(order_id=order_id)
+            canceled_ids = _field(cancel_response, "canceled", default=()) or ()
+            not_canceled = _field(cancel_response, "not_canceled", "notCanceled", default={}) or {}
+            cancellation_confirmed = order_id in {str(item) for item in canceled_ids}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            cancel_error = f"{type(exc).__name__}: {_safe_diagnostic_text(exc)}"
+            cancellation_confirmed = False
+            not_canceled = {}
+
+        order_state: Any | None = None
+        last_order_error: str | None = None
+        for cancel_attempt in range(2):
+            try:
+                order_state = await self.client.get_order(order_id=order_id)
+                last_order_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_order_error = f"{type(exc).__name__}: {_safe_diagnostic_text(exc)}"
+                break
+            status = str(_field(order_state, "status", default="") or "").lower()
+            if status in {"canceled", "cancelled", "matched", "filled", "expired"}:
+                break
+            if status not in {"live", "open", "delayed", "unmatched", ""}:
+                break
+            if cancel_attempt == 0:
+                try:
+                    await self.client.cancel_order(order_id=order_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    cancel_error = f"{type(exc).__name__}: {_safe_diagnostic_text(exc)}"
+
+        if order_state is None:
+            raise LiveOrderUnknown(
+                f"could not read final BUY GTC order state order_id={order_id}",
+                diagnostic_fields={
+                    "order_id": order_id, "cancel_error": cancel_error,
+                    "order_query_error": last_order_error,
+                    "cancellation_confirmed": cancellation_confirmed,
+                    "not_canceled": not_canceled,
+                },
+            )
+        status = str(_field(order_state, "status", default="") or "").lower()
+        if status not in {"canceled", "cancelled", "matched", "filled", "expired"}:
+            raise LiveOrderUnknown(
+                f"BUY GTC order is not terminal after cancellation order_id={order_id} status={status}",
+                diagnostic_fields={
+                    "order_id": order_id, "order_status": status,
+                    "cancel_error": cancel_error,
+                    "not_canceled": not_canceled,
+                },
+            )
+
+        raw_matched = _field(order_state, "size_matched", "sizeMatched")
+        try:
+            matched_qty = Decimal(str(raw_matched))
+        except (InvalidOperation, TypeError, ValueError):
+            raise LiveOrderUnknown(
+                f"BUY GTC order omitted a valid cumulative matched quantity order_id={order_id}",
+                diagnostic_fields={"order_id": order_id, "order_status": status,
+                                   "size_matched": raw_matched},
+            )
+        if not matched_qty.is_finite() or matched_qty < 0 or matched_qty > Decimal(str(requested_qty)) + Decimal("0.0001"):
+            raise LiveOrderUnknown(
+                f"BUY GTC order returned an invalid cumulative matched quantity order_id={order_id}",
+                diagnostic_fields={"order_id": order_id, "order_status": status,
+                                   "size_matched": str(matched_qty)},
+            )
+        if matched_qty <= Decimal("0.000001"):
+            return None, {
+                "order_id": order_id, "order_status": status,
+                "size_matched": format(matched_qty, "f"),
+                "remaining_canceled": max(0.0, requested_qty - float(matched_qty)),
+                "cancel_error": cancel_error,
+                "cancellation_confirmed": cancellation_confirmed,
+            }
+
+        trade_rows: list[tuple[str, Decimal, Decimal]] = []
+        last_trade_error: str | None = None
+        for query_attempt in range(4):
+            try:
+                paginator = self.client.list_account_trades(
+                    asset_id=asset_id, market=condition_id,
+                )
+                matched_trades: list[tuple[str, Decimal, Decimal]] = []
+                async for trade in paginator.iter_items():
+                    trade_id = str(_field(trade, "id", "trade_id", "tradeId", default=""))
+                    taker_order_id = str(_field(
+                        trade, "taker_order_id", "takerOrderId", default=""
+                    ) or "")
+                    trade_size = _field(trade, "size", "amount")
+                    trade_price = _field(trade, "price")
+                    if taker_order_id == order_id:
+                        try:
+                            size = Decimal(str(trade_size))
+                            price = Decimal(str(trade_price))
+                        except (InvalidOperation, TypeError, ValueError):
+                            continue
+                        if size > 0 and price > 0:
+                            matched_trades.append((trade_id, size, price))
+                    for maker in (_field(trade, "maker_orders", "makerOrders", default=()) or ()):
+                        maker_id = str(_field(maker, "order_id", "orderId", default="") or "")
+                        if maker_id != order_id:
+                            continue
+                        maker_size = _field(maker, "matched_amount", "matchedAmount", "size")
+                        try:
+                            size = Decimal(str(maker_size))
+                            price = Decimal(str(trade_price))
+                        except (InvalidOperation, TypeError, ValueError):
+                            continue
+                        if size > 0 and price > 0:
+                            matched_trades.append((trade_id, size, price))
+                deduplicated: dict[str, tuple[Decimal, Decimal]] = {}
+                for index, (trade_id, size, price) in enumerate(matched_trades):
+                    deduplicated[trade_id or f"anonymous-{index}"] = (size, price)
+                trade_rows = [
+                    (trade_id, size, price)
+                    for trade_id, (size, price) in deduplicated.items()
+                ]
+                last_trade_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_trade_error = f"{type(exc).__name__}: {_safe_diagnostic_text(exc)}"
+            total_trade_qty = sum((size for _, size, _ in trade_rows), Decimal("0"))
+            if abs(total_trade_qty - matched_qty) <= Decimal("0.0001"):
+                break
+            if query_attempt < 3:
+                await asyncio.sleep(0.2)
+
+        total_trade_qty = sum((size for _, size, _ in trade_rows), Decimal("0"))
+        if abs(total_trade_qty - matched_qty) > Decimal("0.0001"):
+            raise LiveOrderUnknown(
+                f"BUY GTC fills did not reconcile to order size_matched order_id={order_id}",
+                diagnostic_fields={
+                    "order_id": order_id, "order_status": status,
+                    "order_size_matched": format(matched_qty, "f"),
+                    "trade_size_matched": format(total_trade_qty, "f"),
+                    "trade_query_error": last_trade_error,
+                },
+            )
+        notional = sum((size * price for _, size, price in trade_rows), Decimal("0"))
+        filled_qty = float(total_trade_qty)
+        notional_value = float(notional)
+        vwap = notional_value / filled_qty
+        if not (math.isfinite(vwap) and 0 < vwap < 1):
+            raise LiveOrderUnknown(
+                f"BUY GTC fills returned an invalid VWAP order_id={order_id}",
+                diagnostic_fields={"order_id": order_id, "vwap": vwap},
+            )
+        fee = filled_qty * self.fee_rate * vwap * (1.0 - vwap)
+        fill = Fill(
+            requested_qty=requested_qty,
+            filled_qty=filled_qty,
+            notional=notional_value,
+            fee=fee,
+            vwap=vwap,
+            levels=tuple({
+                "price": float(price), "available_size": float(size), "filled_size": float(size)
+            } for _, size, price in trade_rows),
+        )
+        return fill, {
+            "order_id": order_id, "order_status": status,
+            "size_matched": format(matched_qty, "f"),
+            "trade_count": len(trade_rows),
+            "trade_notional": format(notional, "f"),
+            "remaining_canceled": max(0.0, requested_qty - filled_qty),
+            "cancel_error": cancel_error,
+            "cancellation_confirmed": cancellation_confirmed,
+        }
     async def buy_fak(
         self,
         *,
@@ -1215,7 +1540,7 @@ class PolymarketLiveExecutor:
         signed_details.update(
             {
                 "sdk_order_type": "FAK",
-                "sdk_post_only": False,
+                "sdk_post_only": signed_post_only,
                 "sdk_explicit_max_price": (
                     format(max_price_decimal, "f") if is_buy else None
                 ),
